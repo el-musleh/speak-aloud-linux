@@ -3,13 +3,13 @@
 CONFIG_DIR="$HOME/.config/tts_settings"
 WORK_DIR="/tmp/tts_work"
 
-# ── Parse optional CLI args (used by tts-app.py GUI) ─────────────────────────
-# When called from keyboard shortcut (no args), falls back to xsel + config files.
+# ── Parse optional CLI args ───────────────────────────────────────────────────
 OVERRIDE_TEXT=""
 OVERRIDE_EN_VOICE=""
 OVERRIDE_AR_VOICE=""
 OVERRIDE_EN_RATE=""
 OVERRIDE_AR_RATE=""
+OVERRIDE_SPEED=""     # mpv speed multiplier (e.g. 1.5) — used in GUI mode only
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -18,6 +18,7 @@ while [[ $# -gt 0 ]]; do
         --ar-voice) OVERRIDE_AR_VOICE="$2"; shift 2 ;;
         --en-rate)  OVERRIDE_EN_RATE="$2";  shift 2 ;;
         --ar-rate)  OVERRIDE_AR_RATE="$2";  shift 2 ;;
+        --speed)    OVERRIDE_SPEED="$2";    shift 2 ;;
         *) shift ;;
     esac
 done
@@ -25,13 +26,11 @@ done
 # ── Dependency check ──────────────────────────────────────────────────────────
 for cmd in edge-tts mpv python3; do
     if ! command -v "$cmd" &>/dev/null; then
-        notify-send "TTS Error" "Missing dependency: $cmd"
-        exit 1
+        notify-send "TTS Error" "Missing dependency: $cmd"; exit 1
     fi
 done
 if [ -z "$OVERRIDE_TEXT" ] && ! command -v xsel &>/dev/null; then
-    notify-send "TTS Error" "Missing dependency: xsel"
-    exit 1
+    notify-send "TTS Error" "Missing dependency: xsel"; exit 1
 fi
 
 # ── Kill previous audio and clean work dir ────────────────────────────────────
@@ -40,21 +39,16 @@ rm -rf "$WORK_DIR"
 mkdir -p "$WORK_DIR"
 
 # ── Get text ──────────────────────────────────────────────────────────────────
-if [ -n "$OVERRIDE_TEXT" ]; then
-    TEXT="$OVERRIDE_TEXT"
-else
-    TEXT=$(xsel -p)
-fi
+TEXT="${OVERRIDE_TEXT:-$(xsel -p)}"
 [ -z "$TEXT" ] && exit 0
 
 # ── Read config with CLI overrides taking priority ────────────────────────────
 EN_VOICE="${OVERRIDE_EN_VOICE:-$(cat "$CONFIG_DIR/voice"        2>/dev/null || echo "en-US-ChristopherNeural")}"
 AR_VOICE="${OVERRIDE_AR_VOICE:-$(cat "$CONFIG_DIR/arabic_voice" 2>/dev/null || echo "ar-SA-HamedNeural")}"
-EN_RATE="${OVERRIDE_EN_RATE:-$(cat  "$CONFIG_DIR/rate"          2>/dev/null || echo "+50%")}"
-AR_RATE="${OVERRIDE_AR_RATE:-$(cat  "$CONFIG_DIR/arabic_rate"   2>/dev/null || echo "+30%")}"
+EN_RATE="${OVERRIDE_EN_RATE:-$(cat   "$CONFIG_DIR/rate"         2>/dev/null || echo "+50%")}"
+AR_RATE="${OVERRIDE_AR_RATE:-$(cat   "$CONFIG_DIR/arabic_rate"  2>/dev/null || echo "+30%")}"
 
-# ── Split text into language segments ────────────────────────────────────────
-# Writes seg_NNN.lang + seg_NNN.txt into WORK_DIR; prints segment count.
+# ── Split text into language segments ─────────────────────────────────────────
 SEG_COUNT=$(python3 - "$TEXT" "$WORK_DIR" <<'PYEOF'
 import sys, re
 
@@ -90,19 +84,70 @@ print(len(segs))
 PYEOF
 )
 
-# ── Speak each segment with its matching voice and rate ───────────────────────
-for i in $(seq 0 $((SEG_COUNT - 1))); do
-    PAD=$(printf "%03d" "$i")
-    LANG=$(cat "$WORK_DIR/seg_${PAD}.lang")
-    SEG_TEXT=$(cat "$WORK_DIR/seg_${PAD}.txt")
-    AUDIO="$WORK_DIR/seg_${PAD}.mp3"
+# ═════════════════════════════════════════════════════════════════════════════
+# GUI MODE  (--text was provided)
+# ─────────────────────────────────────────────────────────────────────────────
+# Two-pass approach:
+#   Pass 1 — generate all MP3s at normal pitch/speed (no --rate flag).
+#             The speed is controlled entirely by mpv in real-time via IPC.
+#   Pass 2 — play all files as a single mpv playlist so the IPC socket
+#             remains alive for the full duration, allowing tts-app.py to
+#             adjust speed live without interrupting playback.
+# ═════════════════════════════════════════════════════════════════════════════
+if [ -n "$OVERRIDE_TEXT" ]; then
 
-    [ "$LANG" = "ar" ] && VOICE="$AR_VOICE" RATE="$AR_RATE" || VOICE="$EN_VOICE" RATE="$EN_RATE"
+    for i in $(seq 0 $((SEG_COUNT - 1))); do
+        PAD=$(printf "%03d" "$i")
+        LANG=$(cat "$WORK_DIR/seg_${PAD}.lang")
+        SEG_TEXT=$(cat "$WORK_DIR/seg_${PAD}.txt")
+        AUDIO="$WORK_DIR/seg_${PAD}.mp3"
+        [ "$LANG" = "ar" ] && VOICE="$AR_VOICE" || VOICE="$EN_VOICE"
 
-    if ! edge-tts --voice "$VOICE" --rate="$RATE" --text "$SEG_TEXT" --write-media "$AUDIO" 2>/dev/null; then
-        notify-send "TTS Error" "Failed to generate speech (no internet?)"
-        exit 1
-    fi
+        if ! edge-tts --voice "$VOICE" --text "$SEG_TEXT" --write-media "$AUDIO" 2>/dev/null; then
+            notify-send "TTS Error" "Failed to generate speech (no internet?)"; exit 1
+        fi
+    done
 
-    mpv "$AUDIO" --no-terminal --input-ipc-server=/tmp/mpvsocket
-done
+    INITIAL_SPEED="${OVERRIDE_SPEED:-1.5}"
+    mapfile -t FILES < <(ls -1 "$WORK_DIR"/seg_*.mp3 | sort)
+    mpv "${FILES[@]}" --no-terminal --input-ipc-server=/tmp/mpvsocket &
+    MPV_PID=$!
+
+    # Wait for socket, then set initial playback speed
+    for _ in $(seq 1 30); do
+        sleep 0.1
+        if [ -S /tmp/mpvsocket ]; then
+            printf '{"command":["set_property","speed",%s]}\n' "$INITIAL_SPEED" \
+                | socat - /tmp/mpvsocket 2>/dev/null
+            break
+        fi
+    done
+
+    wait "$MPV_PID"
+
+# ═════════════════════════════════════════════════════════════════════════════
+# SHORTCUT MODE  (keyboard shortcut, no --text arg)
+# ─────────────────────────────────────────────────────────────────────────────
+# Original per-segment approach: edge-tts --rate controls speed so the
+# keyboard shortcut still works without the GUI app being open.
+# ═════════════════════════════════════════════════════════════════════════════
+else
+
+    for i in $(seq 0 $((SEG_COUNT - 1))); do
+        PAD=$(printf "%03d" "$i")
+        LANG=$(cat "$WORK_DIR/seg_${PAD}.lang")
+        SEG_TEXT=$(cat "$WORK_DIR/seg_${PAD}.txt")
+        AUDIO="$WORK_DIR/seg_${PAD}.mp3"
+
+        [ "$LANG" = "ar" ] && VOICE="$AR_VOICE" RATE="$AR_RATE" \
+                           || VOICE="$EN_VOICE" RATE="$EN_RATE"
+
+        if ! edge-tts --voice "$VOICE" --rate="$RATE" --text "$SEG_TEXT" \
+                      --write-media "$AUDIO" 2>/dev/null; then
+            notify-send "TTS Error" "Failed to generate speech (no internet?)"; exit 1
+        fi
+
+        mpv "$AUDIO" --no-terminal --input-ipc-server=/tmp/mpvsocket
+    done
+
+fi

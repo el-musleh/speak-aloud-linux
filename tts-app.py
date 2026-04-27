@@ -7,6 +7,7 @@ from gi.repository import Gtk, Adw, GLib
 
 import json
 import os
+import socket as _sock
 import subprocess
 import threading
 
@@ -14,6 +15,7 @@ SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(SCRIPT_DIR, 'config.json')
 SPEAK_SH    = os.path.join(SCRIPT_DIR, 'speak.sh')
 PAUSE_SH    = os.path.join(SCRIPT_DIR, 'speak-pause.sh')
+MPV_SOCKET  = '/tmp/mpvsocket'
 
 
 def get_selection() -> str:
@@ -49,7 +51,6 @@ class TTSWindow(Adw.ApplicationWindow):
         tv = Adw.ToolbarView()
         self.set_content(tv)
 
-        # Header bar
         hb = Adw.HeaderBar()
         grab_btn = Gtk.Button(icon_name='view-refresh-symbolic',
                               tooltip_text='Grab highlighted text (refresh preview)')
@@ -57,7 +58,6 @@ class TTSWindow(Adw.ApplicationWindow):
         hb.pack_start(grab_btn)
         tv.add_top_bar(hb)
 
-        # Scrollable clamp
         scroll = Gtk.ScrolledWindow(vexpand=True,
                                     hscrollbar_policy=Gtk.PolicyType.NEVER)
         clamp = Adw.Clamp(maximum_size=520, tightening_threshold=420)
@@ -73,7 +73,7 @@ class TTSWindow(Adw.ApplicationWindow):
 
         self._tbuf = Gtk.TextBuffer()
         self._tbuf.set_text(
-            'Highlight text anywhere on screen, then press ↺ above or click Speak.')
+            'Highlight text anywhere on screen, then press ↺ or click Speak.')
 
         tview = Gtk.TextView(
             buffer=self._tbuf,
@@ -110,7 +110,13 @@ class TTSWindow(Adw.ApplicationWindow):
         root.append(voice_group)
 
         # ── Speed sliders ─────────────────────────────────────────────────────
-        speed_group = Adw.PreferencesGroup(title='Playback Speed  (0 % = normal, 100 % = 2×)')
+        # Slider range 0–100 represents a +0% to +100% speed offset.
+        # This maps to mpv speed 1.0×–2.0× via: mpv_speed = (100 + val) / 100
+        # Moving a slider during playback sends set_property speed to mpv IPC
+        # in real-time — no audio restart needed.
+        speed_group = Adw.PreferencesGroup(
+            title='Playback Speed',
+            description='Drag during playback for instant real-time adjustment')
 
         self._en_speed_lbl, en_speed_row = self._make_speed_row('English', 50)
         self._ar_speed_lbl, ar_speed_row = self._make_speed_row('Arabic',  30)
@@ -144,16 +150,16 @@ class TTSWindow(Adw.ApplicationWindow):
 
     def _make_speed_row(self, title: str, default: int):
         """Return (label_widget, ActionRow) for a speed slider row."""
-        lbl = Gtk.Label(label=f'+{default}%', width_chars=6, xalign=1.0)
+        lbl = Gtk.Label(label=f'+{default}%  ({(100+default)/100:.1f}×)',
+                        width_chars=12, xalign=1.0)
         lbl.add_css_class('dim-label')
 
         scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 5)
         scale.set_value(default)
         scale.set_draw_value(False)
         scale.set_hexpand(True)
-        scale.set_size_request(160, -1)
-        scale.connect('value-changed',
-                      lambda s, l=lbl: l.set_label(f'+{int(s.get_value())}%'))
+        scale.set_size_request(140, -1)
+        scale.connect('value-changed', self._on_speed_changed, lbl)
 
         if title == 'English':
             self._en_scale = scale
@@ -161,7 +167,7 @@ class TTSWindow(Adw.ApplicationWindow):
             self._ar_scale = scale
 
         suffix = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL,
-                         spacing=6, valign=Gtk.Align.CENTER)
+                         spacing=8, valign=Gtk.Align.CENTER)
         suffix.append(scale)
         suffix.append(lbl)
 
@@ -178,10 +184,18 @@ class TTSWindow(Adw.ApplicationWindow):
         ar_spd = sel.get('arabic_speed',  30)
         self._en_scale.set_value(en_spd)
         self._ar_scale.set_value(ar_spd)
-        self._en_speed_lbl.set_label(f'+{en_spd}%')
-        self._ar_speed_lbl.set_label(f'+{ar_spd}%')
+        self._en_speed_lbl.set_label(f'+{en_spd}%  ({(100+en_spd)/100:.1f}×)')
+        self._ar_speed_lbl.set_label(f'+{ar_spd}%  ({(100+ar_spd)/100:.1f}×)')
 
     # ── Signal handlers ───────────────────────────────────────────────────────
+
+    def _on_speed_changed(self, scale, lbl):
+        val = int(scale.get_value())
+        mpv_speed = (100 + val) / 100
+        lbl.set_label(f'+{val}%  ({mpv_speed:.1f}×)')
+        # If audio is currently playing, push the new speed to mpv immediately
+        if self._stop_btn.get_sensitive():
+            self._send_mpv(['set_property', 'speed', round(mpv_speed, 3)])
 
     def _grab_and_preview(self) -> str:
         text = get_selection()
@@ -201,6 +215,9 @@ class TTSWindow(Adw.ApplicationWindow):
         en_rate  = f"+{int(self._en_scale.get_value())}%"
         ar_rate  = f"+{int(self._ar_scale.get_value())}%"
 
+        # Convert EN speed offset to mpv multiplier for initial playback speed
+        initial_speed = round((100 + int(self._en_scale.get_value())) / 100, 3)
+
         self._save_settings(en_idx, ar_idx)
         self._set_playing(True)
 
@@ -212,7 +229,8 @@ class TTSWindow(Adw.ApplicationWindow):
                      '--en-voice', en_voice,
                      '--ar-voice', ar_voice,
                      '--en-rate',  en_rate,
-                     '--ar-rate',  ar_rate],
+                     '--ar-rate',  ar_rate,
+                     '--speed',    str(initial_speed)],
                     capture_output=True,
                 )
                 if proc.returncode != 0:
@@ -231,6 +249,22 @@ class TTSWindow(Adw.ApplicationWindow):
     def _on_stop(self, _btn):
         subprocess.run(['pkill', '-f', 'mpv'], capture_output=True)
         self._set_playing(False)
+
+    # ── mpv IPC ───────────────────────────────────────────────────────────────
+
+    def _send_mpv(self, command: list):
+        """Send a JSON command to the running mpv IPC socket (fire-and-forget)."""
+        def _do():
+            try:
+                s = _sock.socket(_sock.AF_UNIX, _sock.SOCK_STREAM)
+                s.settimeout(0.3)
+                s.connect(MPV_SOCKET)
+                s.sendall((json.dumps({'command': command}) + '\n').encode())
+                s.close()
+            except Exception:
+                pass  # socket not ready yet or mpv not running — silently ignore
+        # Run in a throwaway thread so the UI never blocks on socket I/O
+        threading.Thread(target=_do, daemon=True).start()
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
