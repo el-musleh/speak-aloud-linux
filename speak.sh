@@ -96,6 +96,8 @@ PYEOF
 # ═════════════════════════════════════════════════════════════════════════════
 if [ -n "$OVERRIDE_TEXT" ]; then
 
+    echo "STATUS:GENERATING"
+
     for i in $(seq 0 $((SEG_COUNT - 1))); do
         PAD=$(printf "%03d" "$i")
         LANG=$(cat "$WORK_DIR/seg_${PAD}.lang")
@@ -104,9 +106,12 @@ if [ -n "$OVERRIDE_TEXT" ]; then
         [ "$LANG" = "ar" ] && VOICE="$AR_VOICE" || VOICE="$EN_VOICE"
 
         if ! edge-tts --voice "$VOICE" --text "$SEG_TEXT" --write-media "$AUDIO" 2>/dev/null; then
+            echo "STATUS:ERROR"
             notify-send "TTS Error" "Failed to generate speech (no internet?)"; exit 1
         fi
     done
+
+    echo "STATUS:PLAYING"
 
     INITIAL_SPEED="${OVERRIDE_SPEED:-1.5}"
     mapfile -t FILES < <(ls -1 "$WORK_DIR"/seg_*.mp3 | sort)
