@@ -5,10 +5,12 @@ gi.require_version('Gtk', '4.0')
 gi.require_version('Adw', '1')
 from gi.repository import Gtk, Adw, GLib
 
+import atexit
+import fcntl
 import json
 import os
-import select
 import shutil
+import signal
 import socket as _sock
 import subprocess
 import threading
@@ -20,6 +22,7 @@ SPEAK_SH    = os.path.join(SCRIPT_DIR, 'speak.sh')
 PAUSE_SH    = os.path.join(SCRIPT_DIR, 'speak-pause.sh')
 MPV_SOCKET  = '/tmp/mpvsocket'
 WORK_DIR    = '/tmp/tts_work'
+MAX_CHARS   = 5000
 
 
 class AppState(Enum):
@@ -40,18 +43,172 @@ def get_selection() -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Audio Engine — separated from the UI layer
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TTSManager:
+    """
+    Manages the TTS subprocess lifecycle.
+
+    All I/O monitoring is done via GLib.io_add_watch (event-driven, runs on
+    the GLib main loop — no background thread needed for reading stdout).
+    State callbacks are invoked on the main loop, so they are safe to call
+    GTK code directly.
+    """
+
+    def __init__(self, on_state_change: callable, on_error: callable):
+        self._proc      = None
+        self._io_watch  = None
+        self._on_state  = on_state_change   # (AppState) → None
+        self._on_error  = on_error          # (str) → None
+        atexit.register(self._hard_kill)    # best-effort cleanup on unexpected exit
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
+    def speak(self, cmd_args: list) -> None:
+        """Kill any running process, then launch a new TTS subprocess."""
+        self._terminate()   # stop old process without firing state callbacks
+
+        self._proc = subprocess.Popen(
+            cmd_args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,     # own process group: killpg kills children too
+        )
+
+        # Non-blocking stdout so io_add_watch reads never stall the main loop
+        fd = self._proc.stdout.fileno()
+        fcntl.fcntl(fd, fcntl.F_SETFL,
+                    fcntl.fcntl(fd, fcntl.F_GETFL) | os.O_NONBLOCK)
+
+        self._io_watch = GLib.io_add_watch(
+            fd,
+            GLib.IOCondition.IN | GLib.IOCondition.HUP,
+            self._on_stdout,
+        )
+
+    def kill(self) -> None:
+        """Graceful stop: SIGTERM → 3 s grace period → SIGKILL. Fires IDLE callback."""
+        self._cancel_watch()
+        self._sigterm_proc(self._proc)
+        self._proc = None
+        self._cleanup()
+        self._on_state(AppState.IDLE)
+
+    def send_mpv(self, command: list) -> None:
+        """Fire-and-forget: send a JSON command to the running mpv IPC socket."""
+        def _do():
+            try:
+                s = _sock.socket(_sock.AF_UNIX, _sock.SOCK_STREAM)
+                s.settimeout(0.3)
+                s.connect(MPV_SOCKET)
+                s.sendall((json.dumps({'command': command}) + '\n').encode())
+                s.close()
+            except Exception:
+                pass
+        threading.Thread(target=_do, daemon=True).start()
+
+    # ── GLib I/O callback ─────────────────────────────────────────────────────
+
+    def _on_stdout(self, fd: int, condition: GLib.IOCondition) -> bool:
+        """
+        Called by GLib on the main loop whenever the subprocess stdout has data
+        (IN) or the write-end of the pipe is closed because the process exited
+        (HUP).  Returning SOURCE_REMOVE unregisters this watch.
+        """
+        if condition & GLib.IOCondition.IN:
+            try:
+                data = os.read(fd, 4096).decode(errors='replace')
+                for line in data.splitlines():
+                    self._dispatch(line.strip())
+            except OSError:
+                pass
+
+        if condition & GLib.IOCondition.HUP:
+            self._io_watch = None
+            rc = self._proc.wait() if self._proc else 0
+            self._proc = None
+            self._cleanup()
+            if rc != 0:
+                self._on_error(
+                    'speak.sh exited with an error.\n'
+                    'Check your internet connection.')
+            self._on_state(AppState.IDLE)
+            return GLib.SOURCE_REMOVE
+
+        return GLib.SOURCE_CONTINUE
+
+    def _dispatch(self, line: str) -> None:
+        if line == 'STATUS:GENERATING':
+            self._on_state(AppState.GENERATING)
+        elif line == 'STATUS:PLAYING':
+            self._on_state(AppState.PLAYING)
+        elif line == 'STATUS:ERROR':
+            self._on_error(
+                'Failed to generate speech.\n'
+                'Check your internet connection.')
+
+    # ── Private helpers ───────────────────────────────────────────────────────
+
+    def _terminate(self) -> None:
+        """Stop the running process without firing any state callbacks."""
+        self._cancel_watch()
+        self._sigterm_proc(self._proc)
+        self._proc = None
+
+    def _cancel_watch(self) -> None:
+        if self._io_watch is not None:
+            GLib.source_remove(self._io_watch)
+            self._io_watch = None
+
+    @staticmethod
+    def _sigterm_proc(proc) -> None:
+        """Send SIGTERM to the process group; escalate to SIGKILL after 3 s."""
+        if proc is None or proc.poll() is not None:
+            return
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            proc.wait(timeout=3)
+        except (subprocess.TimeoutExpired, ProcessLookupError, OSError):
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (ProcessLookupError, OSError):
+                pass
+
+    @staticmethod
+    def _cleanup() -> None:
+        subprocess.run(['pkill', '-f', 'mpv'], capture_output=True)
+        shutil.rmtree(WORK_DIR, ignore_errors=True)
+
+    def _hard_kill(self) -> None:
+        """atexit handler: best-effort kill with no GLib/GTK calls."""
+        try:
+            proc = self._proc
+            if proc and proc.poll() is None:
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except (ProcessLookupError, OSError):
+                    pass
+            try:
+                subprocess.run(['pkill', '-f', 'mpv'], timeout=2,
+                               capture_output=True)
+            except Exception:
+                pass
+            shutil.rmtree(WORK_DIR, ignore_errors=True)
+        except Exception:
+            pass
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# UI layer
+# ─────────────────────────────────────────────────────────────────────────────
 
 class TTSWindow(Adw.ApplicationWindow):
 
-    # State machine configuration: maps AppState → (button_label, button_css,
-    # pause_sensitive, status_icon, status_text)
     _STATE_UI = {
-        AppState.IDLE:       ('▶  Speak',    'suggested-action', False,
-                              '○', 'Ready — highlight text and press Speak'),
-        AppState.GENERATING: ('■  Stop',     'destructive-action', False,
-                              '⟳', 'Generating audio…'),
-        AppState.PLAYING:    ('■  Stop',     'destructive-action', True,
-                              '♪', 'Playing…'),
+        AppState.IDLE:       ('▶  Speak', 'suggested-action',  False, '○', 'Ready — highlight text and press Speak'),
+        AppState.GENERATING: ('■  Stop',  'destructive-action', False, '⟳', 'Generating audio…'),
+        AppState.PLAYING:    ('■  Stop',  'destructive-action', True,  '♪', 'Playing…'),
     }
 
     def __init__(self, **kwargs):
@@ -62,14 +219,20 @@ class TTSWindow(Adw.ApplicationWindow):
         with open(CONFIG_PATH) as f:
             self.config = json.load(f)
 
-        self._state   = AppState.IDLE
-        self._proc    = None          # active subprocess.Popen
-        self._poll_id = None          # GLib timer source ID
+        self._state     = AppState.IDLE
         self._is_paused = False
+
+        # TTSManager callbacks run on the GLib main loop (via io_add_watch),
+        # so they are safe to update GTK widgets directly.
+        self._manager = TTSManager(
+            on_state_change=self._set_state,
+            on_error=self._show_error,
+        )
 
         self._build_ui()
         self._load_saved_settings()
         self.connect('close-request', self._on_close_request)
+        GLib.idle_add(self._check_wayland_clipboard)   # warn once after window shows
 
     # ── UI construction ───────────────────────────────────────────────────────
 
@@ -112,13 +275,18 @@ class TTSWindow(Adw.ApplicationWindow):
         tview.add_css_class('card')
 
         tscroll = Gtk.ScrolledWindow(
-            min_content_height=90,
-            max_content_height=160,
+            min_content_height=90, max_content_height=160,
             hscrollbar_policy=Gtk.PolicyType.NEVER,
         )
         tscroll.set_child(tview)
         preview_group.add(tscroll)
         root.append(preview_group)
+
+        # ── Char counter row ──────────────────────────────────────────────────
+        self._char_lbl = Gtk.Label(label='', xalign=1.0)
+        self._char_lbl.add_css_class('dim-label')
+        self._char_lbl.add_css_class('caption')
+        root.append(self._char_lbl)
 
         # ── Voice selection ───────────────────────────────────────────────────
         voice_group = Adw.PreferencesGroup(title='Voices')
@@ -140,14 +308,13 @@ class TTSWindow(Adw.ApplicationWindow):
             title='Playback Speed',
             description='Drag during playback for instant real-time adjustment')
 
-        self._en_speed_lbl, en_speed_row = self._make_speed_row('English', 50)
-        self._ar_speed_lbl, ar_speed_row = self._make_speed_row('Arabic',  30)
-
-        speed_group.add(en_speed_row)
-        speed_group.add(ar_speed_row)
+        self._en_speed_lbl, en_row = self._make_speed_row('English', 50)
+        self._ar_speed_lbl, ar_row = self._make_speed_row('Arabic',  30)
+        speed_group.add(en_row)
+        speed_group.add(ar_row)
         root.append(speed_group)
 
-        # ── Controls: Speak/Stop toggle + Pause ───────────────────────────────
+        # ── Controls ──────────────────────────────────────────────────────────
         btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL,
                           spacing=8, homogeneous=True)
 
@@ -167,8 +334,7 @@ class TTSWindow(Adw.ApplicationWindow):
         # ── Status bar ────────────────────────────────────────────────────────
         self._status_lbl = Gtk.Label(
             label='○  Ready — highlight text and press Speak',
-            xalign=0.5,
-            wrap=True,
+            xalign=0.5, wrap=True,
         )
         self._status_lbl.add_css_class('dim-label')
         self._status_lbl.add_css_class('caption')
@@ -218,16 +384,12 @@ class TTSWindow(Adw.ApplicationWindow):
         self._state = state
         label, css, pause_on, icon, status = self._STATE_UI[state]
 
-        # Update primary button
         self._primary_btn.set_label(label)
         for cls in ('suggested-action', 'destructive-action'):
             self._primary_btn.remove_css_class(cls)
         self._primary_btn.add_css_class(css)
 
-        # Update pause button
         self._pause_btn.set_sensitive(pause_on)
-
-        # Update status label
         self._status_lbl.set_label(f'{icon}  {status}')
 
         if state == AppState.IDLE:
@@ -239,11 +401,14 @@ class TTSWindow(Adw.ApplicationWindow):
     def _on_primary(self, _btn):
         if self._state == AppState.IDLE:
             text = self._grab_and_preview()
-            if text:
-                self._start_speaking(text)
+            if not text:
+                return
+            if len(text) > MAX_CHARS:
+                self._show_char_limit_warning(len(text))
+                return
+            self._start_speaking(text)
         else:
-            # GENERATING or PLAYING → stop
-            self._kill_process()
+            self._manager.kill()
 
     def _on_pause_resume(self, _btn):
         subprocess.run(['bash', PAUSE_SH], capture_output=True)
@@ -255,13 +420,13 @@ class TTSWindow(Adw.ApplicationWindow):
         mpv_speed = (100 + val) / 100
         lbl.set_label(f'+{val}%  ({mpv_speed:.1f}×)')
         if self._state == AppState.PLAYING:
-            self._send_mpv(['set_property', 'speed', round(mpv_speed, 3)])
+            self._manager.send_mpv(['set_property', 'speed', round(mpv_speed, 3)])
 
-    def _on_close_request(self, _win):
-        self._kill_process()
-        return False
+    def _on_close_request(self, _win) -> bool:
+        self._manager.kill()
+        return False    # allow the window to close
 
-    # ── Process lifecycle ─────────────────────────────────────────────────────
+    # ── Core actions ──────────────────────────────────────────────────────────
 
     def _start_speaking(self, text: str):
         en_idx   = self._en_combo.get_selected()
@@ -270,107 +435,49 @@ class TTSWindow(Adw.ApplicationWindow):
         ar_voice = self.config['voices']['arabic'][ar_idx]['id']
         en_rate  = f"+{int(self._en_scale.get_value())}%"
         ar_rate  = f"+{int(self._ar_scale.get_value())}%"
-        initial_speed = round((100 + int(self._en_scale.get_value())) / 100, 3)
+        speed    = round((100 + int(self._en_scale.get_value())) / 100, 3)
 
         self._save_settings(en_idx, ar_idx)
-        self._set_state(AppState.GENERATING)
+        self._set_state(AppState.GENERATING)   # immediate feedback before first STATUS line
 
-        self._proc = subprocess.Popen(
-            ['bash', SPEAK_SH,
-             '--text',     text,
-             '--en-voice', en_voice,
-             '--ar-voice', ar_voice,
-             '--en-rate',  en_rate,
-             '--ar-rate',  ar_rate,
-             '--speed',    str(initial_speed)],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-        )
-
-        # Start polling loop: 100 ms ticks to read stdout and detect completion
-        if self._poll_id is not None:
-            GLib.source_remove(self._poll_id)
-        self._poll_id = GLib.timeout_add(100, self._poll_process)
-
-    def _poll_process(self) -> bool:
-        """Called every 100 ms by GLib to check process state and read stdout."""
-        if self._proc is None:
-            self._poll_id = None
-            return GLib.SOURCE_REMOVE
-
-        # Non-blocking read — select() returns immediately if no data ready
-        readable, _, _ = select.select([self._proc.stdout], [], [], 0)
-        if readable:
-            line = self._proc.stdout.readline().decode(errors='replace').strip()
-            if line == 'STATUS:GENERATING':
-                self._set_state(AppState.GENERATING)
-            elif line == 'STATUS:PLAYING':
-                self._set_state(AppState.PLAYING)
-            elif line == 'STATUS:ERROR':
-                self._show_error('speak.sh failed.\nCheck your internet connection.')
-
-        # Check if the process has finished on its own
-        if self._proc.poll() is not None:
-            self._poll_id = None
-            self._handle_process_end(self._proc.returncode)
-            return GLib.SOURCE_REMOVE
-
-        return GLib.SOURCE_CONTINUE
-
-    def _handle_process_end(self, returncode: int):
-        self._proc = None
-        self._cleanup_temp_files()
-        if returncode == 0:
-            self._set_state(AppState.IDLE)
-        else:
-            self._set_state(AppState.IDLE)
-            self._show_error('speak.sh exited with an error.\n'
-                             'Check your internet connection.')
-
-    def _kill_process(self):
-        proc = self._proc
-        self._proc = None           # signal the poll loop to stop
-        if self._poll_id is not None:
-            GLib.source_remove(self._poll_id)
-            self._poll_id = None
-        if proc and proc.poll() is None:
-            proc.kill()
-            try:
-                proc.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-        subprocess.run(['pkill', '-f', 'mpv'], capture_output=True)
-        self._cleanup_temp_files()
-        self._set_state(AppState.IDLE)
-
-    @staticmethod
-    def _cleanup_temp_files():
-        """Delete temp MP3 segments and work directory."""
-        if os.path.isdir(WORK_DIR):
-            shutil.rmtree(WORK_DIR, ignore_errors=True)
-
-    # ── mpv IPC ───────────────────────────────────────────────────────────────
-
-    def _send_mpv(self, command: list):
-        """Fire-and-forget: send a JSON command to the mpv IPC socket."""
-        def _do():
-            try:
-                s = _sock.socket(_sock.AF_UNIX, _sock.SOCK_STREAM)
-                s.settimeout(0.3)
-                s.connect(MPV_SOCKET)
-                s.sendall((json.dumps({'command': command}) + '\n').encode())
-                s.close()
-            except Exception:
-                pass
-        threading.Thread(target=_do, daemon=True).start()
-
-    # ── Helpers ───────────────────────────────────────────────────────────────
+        self._manager.speak([
+            'bash', SPEAK_SH,
+            '--text',     text,
+            '--en-voice', en_voice,
+            '--ar-voice', ar_voice,
+            '--en-rate',  en_rate,
+            '--ar-rate',  ar_rate,
+            '--speed',    str(speed),
+        ])
 
     def _grab_and_preview(self) -> str:
         text = get_selection()
         self._tbuf.set_text(
             text if text else '(Nothing selected — highlight some text first.)')
+        n = len(text)
+        if n > 0:
+            color = 'error' if n > MAX_CHARS else 'dim-label'
+            self._char_lbl.set_label(f'{n:,} / {MAX_CHARS:,} characters')
+            self._char_lbl.set_css_classes(['caption', color])
+        else:
+            self._char_lbl.set_label('')
         return text
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _check_wayland_clipboard(self) -> bool:
+        """Show a one-time warning if on Wayland and wl-clipboard is missing."""
+        if os.environ.get('WAYLAND_DISPLAY') and not shutil.which('wl-paste'):
+            dialog = Adw.MessageDialog(
+                transient_for=self,
+                heading='Missing Dependency',
+                body='You are on Wayland but wl-clipboard is not installed.\n'
+                     'Highlighted text selection will not work.\n\n'
+                     'Fix with:  sudo apt install wl-clipboard',
+            )
+            dialog.add_response('ok', 'OK')
+            dialog.present()
+        return GLib.SOURCE_REMOVE   # run once via idle_add, then stop
 
     def _save_settings(self, en_idx: int, ar_idx: int):
         self.config.setdefault('selected', {})
@@ -381,11 +488,19 @@ class TTSWindow(Adw.ApplicationWindow):
         with open(CONFIG_PATH, 'w') as f:
             json.dump(self.config, f, indent=2)
 
-    def _show_error(self, message: str):
+    def _show_error(self, message: str) -> None:
+        dialog = Adw.MessageDialog(
+            transient_for=self, heading='TTS Error', body=message)
+        dialog.add_response('ok', 'OK')
+        dialog.present()
+
+    def _show_char_limit_warning(self, char_count: int) -> None:
         dialog = Adw.MessageDialog(
             transient_for=self,
-            heading='TTS Error',
-            body=message,
+            heading='Selection Too Long',
+            body=f'Selected text is {char_count:,} characters '
+                 f'(limit: {MAX_CHARS:,}).\n\n'
+                 'Please select a shorter passage.',
         )
         dialog.add_response('ok', 'OK')
         dialog.present()
