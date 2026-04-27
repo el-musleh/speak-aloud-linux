@@ -568,16 +568,37 @@ class TTSWindow(Adw.ApplicationWindow):
         return GLib.SOURCE_REMOVE
 
     def _save_settings(self, en_idx: int, ar_idx: int):
+        en_rate = int(self._en_scale.get_value())
+        ar_rate = int(self._ar_scale.get_value())
+        en_voice = self.config['voices']['english'][en_idx]['id']
+        ar_voice = self.config['voices']['arabic'][ar_idx]['id']
+
+        # 1. Save to internal config.json (for GUI app state)
         self.config.setdefault('selected', {})
         self.config['selected']['english_voice_index'] = en_idx
         self.config['selected']['arabic_voice_index']  = ar_idx
-        self.config['selected']['english_speed'] = int(self._en_scale.get_value())
-        self.config['selected']['arabic_speed']  = int(self._ar_scale.get_value())
+        self.config['selected']['english_speed'] = en_rate
+        self.config['selected']['arabic_speed']  = ar_rate
         try:
             with open(CONFIG_PATH, 'w') as f:
                 json.dump(self.config, f, indent=2)
         except OSError:
-            pass    # non-fatal; settings just won't persist this session
+            pass
+
+        # 2. Sync to ~/.config/tts_settings (for speak.sh / shortcut mode)
+        shell_cfg = os.path.expanduser('~/.config/tts_settings')
+        try:
+            os.makedirs(shell_cfg, exist_ok=True)
+            with open(os.path.join(shell_cfg, 'voice'), 'w') as f:
+                f.write(en_voice)
+            with open(os.path.join(shell_cfg, 'arabic_voice'), 'w') as f:
+                f.write(ar_voice)
+            with open(os.path.join(shell_cfg, 'rate'), 'w') as f:
+                f.write(f"+{en_rate}%")
+            with open(os.path.join(shell_cfg, 'arabic_rate'), 'w') as f:
+                f.write(f"+{ar_rate}%")
+        except OSError:
+            pass
 
     def _show_error(self, message: str) -> None:
         dialog = Adw.MessageDialog(
