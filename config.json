@@ -1,0 +1,20 @@
+{
+  "voices": {
+    "english": [
+      {"id": "en-US-ChristopherNeural", "name": "Christopher (US)"},
+      {"id": "en-US-GuyNeural",         "name": "Guy (US)"},
+      {"id": "en-GB-RyanNeural",        "name": "Ryan (UK)"}
+    ],
+    "arabic": [
+      {"id": "ar-SA-HamedNeural",   "name": "Hamed (Saudi)"},
+      {"id": "ar-SA-ZariyahNeural", "name": "Zariyah (Saudi)"},
+      {"id": "ar-EG-SalmaNeural",   "name": "Salma (Egypt)"}
+    ]
+  },
+  "selected": {
+    "english_voice_index": 0,
+    "arabic_voice_index":  0,
+    "english_speed": 50,
+    "arabic_speed":  30
+  }
+}
