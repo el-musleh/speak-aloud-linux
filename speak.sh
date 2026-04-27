@@ -34,7 +34,7 @@ if [ -z "$OVERRIDE_TEXT" ] && ! command -v xsel &>/dev/null; then
 fi
 
 # ── Kill previous audio and clean work dir ────────────────────────────────────
-pkill -f mpv 2>/dev/null
+pkill -f "input-ipc-server=/tmp/mpvsocket" 2>/dev/null
 rm -rf "$WORK_DIR"
 mkdir -p "$WORK_DIR"
 
@@ -115,6 +115,7 @@ if [ -n "$OVERRIDE_TEXT" ]; then
 
     INITIAL_SPEED="${OVERRIDE_SPEED:-1.5}"
     mapfile -t FILES < <(ls -1 "$WORK_DIR"/seg_*.mp3 | sort)
+    rm -f /tmp/mpvsocket
     mpv "${FILES[@]}" --no-terminal --input-ipc-server=/tmp/mpvsocket &
     MPV_PID=$!
 
@@ -129,6 +130,7 @@ if [ -n "$OVERRIDE_TEXT" ]; then
     done
 
     wait "$MPV_PID"
+    rm -f /tmp/mpvsocket
 
 # ═════════════════════════════════════════════════════════════════════════════
 # SHORTCUT MODE  (keyboard shortcut, no --text arg)
