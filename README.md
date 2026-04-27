@@ -57,6 +57,21 @@ Launch the app with `python3 tts-app.py`. Highlight any text on your screen, the
 ### Using the Shortcut
 Highlight text in any application (browser, PDF viewer, terminal) and press your assigned shortcut (`Super + S`). The script will detect the languages and start speaking immediately.
 
+## ❓ Troubleshooting
+
+### "Namespace Gtk not available for version 4.0"
+If you see this error when running `tts-app.py`, it means the GTK 4 introspection libraries are missing. Fix it by running:
+```bash
+sudo apt update
+sudo apt install gir1.2-gtk-4.0 gir1.2-adw-1
+```
+
+### Wayland Selection Issues
+If you are on Wayland and the app cannot grab highlighted text, ensure `wl-clipboard` is installed:
+```bash
+sudo apt install wl-clipboard
+```
+
 ---
 
 *Powered by Microsoft Edge TTS and mpv.*

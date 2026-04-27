@@ -60,11 +60,21 @@ echo ""
 
 # ── Step 5: Verify GTK4 / Libadwaita ─────────
 echo -e "${BOLD}[5/5] Verifying GTK4 + Libadwaita Python bindings...${RESET}"
-if python3 -c "import gi; gi.require_version('Adw','1'); from gi.repository import Adw" 2>/dev/null; then
+MISSING=0
+if ! python3 -c "import gi; gi.require_version('Gtk', '4.0')" 2>/dev/null; then
+    echo -e "${YELLOW}⚠ GTK 4.0 Python bindings not found.${RESET}"
+    MISSING=1
+fi
+if ! python3 -c "import gi; gi.require_version('Adw', '1')" 2>/dev/null; then
+    echo -e "${YELLOW}⚠ Libadwaita (Adw) 1.0 Python bindings not found.${RESET}"
+    MISSING=1
+fi
+
+if [ $MISSING -eq 0 ]; then
     echo -e "${GREEN}✓ GTK4 / Libadwaita bindings OK${RESET}"
 else
-    echo -e "${YELLOW}⚠ Libadwaita bindings not found. The GUI app (tts-app.py) won't work.${RESET}"
-    echo -e "  Try: sudo apt install gir1.2-adw-1"
+    echo -e "${YELLOW}The GUI app (tts-app.py) requires these bindings to run.${RESET}"
+    echo -e "Try installing them manually: ${CYAN}sudo apt install gir1.2-gtk-4.0 gir1.2-adw-1${RESET}"
 fi
 echo ""
 
