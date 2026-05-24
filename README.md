@@ -16,13 +16,21 @@ A production-grade Text-to-Speech (TTS) solution for Linux, designed for seamles
 
 The project relies on several system-level packages. The included `install.sh` script will attempt to install these for you on Debian/Ubuntu-based systems (like Linux Mint).
 
+### Local Dependencies
+- **mpv** - Included locally in `bin/` directory (no system installation required)
+
+### System Packages
 - **Python 3** & **PyGObject** (`python3-gi`, `python3-gi-cairo`)
 - **Libadwaita** (`gir1.2-adw-1`, `gir1.2-gtk-4.0`)
-- **mpv:** For high-performance audio playback and IPC control.
 - **edge-tts:** The core neural speech engine (installed via `pipx`).
 - **xsel** / **wl-clipboard:** For reading the primary selection (highlighted text).
 - **socat:** For Inter-Process Communication with the audio player.
 - **yad:** (Optional) For the legacy CLI-based settings dialog.
+
+Install manually if needed:
+```bash
+sudo apt install xsel yad socat wl-clipboard python3-gi python3-gi-cairo gir1.2-gtk-4.0 gir1.2-adw-1
+```
 
 ## 📦 Installation
 
@@ -44,10 +52,24 @@ For the best experience, add these custom shortcuts in your desktop environment 
 
 | Action | Command | Recommended Shortcut |
 | :--- | :--- | :--- |
-| **Speak Selection** | `~/speak-aloud-linux/speak.sh` | `Super + S` |
-| **Pause / Resume** | `~/speak-aloud-linux/speak-pause.sh` | `Super + P` |
-| **Stop Speech** | `pkill -f "input-ipc-server=/tmp/mpvsocket"` | `Super + Shift + S` |
-| **Open GUI App** | `python3 ~/speak-aloud-linux/tts-app.py` | `Super + A` |
+| **Speak Selection** | `./speak.sh` | `Super + S` |
+| **Pause / Resume** | `./speak-pause.sh` | `Super + P` |
+| **Stop Speech** | `pkill -f mpv` | `Shift + Super + S` |
+| **Open GUI App** | `python3 tts-app.py` | `Super + A` |
+
+### Automated Setup
+
+You can use the included `setup-tts-shortcuts.sh` script to automatically configure the keyboard shortcuts for Cinnamon (Linux Mint default):
+
+```bash
+./setup-tts-shortcuts.sh
+```
+
+This script will:
+- Configure **Speak Selection** (Super + S) to run `./speak.sh`
+- Configure **Stop Speech** (Shift + Super + S) to run `pkill -f mpv`
+
+**Note:** This script only works with Cinnamon desktop environment. For other desktop environments, configure shortcuts manually using the table above.
 
 ## 🖥️ Usage
 
@@ -71,6 +93,13 @@ If you are on Wayland and the app cannot grab highlighted text, ensure `wl-clipb
 ```bash
 sudo apt install wl-clipboard
 ```
+
+### Missing mpv dependency
+If you see "TTS Error: Missing dependency: mpv", verify the local binary exists:
+```bash
+ls -la bin/mpv
+```
+The mpv binary is included locally in the `bin/` directory and should be automatically used by `speak.sh`.
 
 ---
 

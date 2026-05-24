@@ -1,6 +1,15 @@
-__pycache__/
-*.pyc
-/tmp/tts_work/
-/tmp/mpvsocket
-.gemini/
-.claude/
+# Default-deny; track project files
+*
+
+!.gitignore
+!*.md
+!*.json
+!*.yaml
+!*.yml
+!*.toml
+!*.txt
+!*.py
+!*.js
+!*.ts
+!*.html
+!*.css

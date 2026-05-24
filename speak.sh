@@ -1,5 +1,9 @@
 #!/bin/bash
 
+# Add local bin directory to PATH for mpv
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export PATH="$SCRIPT_DIR/bin:$PATH"
+
 CONFIG_DIR="$HOME/.config/tts_settings"
 WORK_DIR="/tmp/tts_work"
 

@@ -24,7 +24,17 @@ echo ""
 # ── Step 1: System packages ──────────────────
 echo -e "${BOLD}[1/5] Installing system dependencies...${RESET}"
 sudo apt update -qq
-sudo apt install -y pipx mpv xsel yad socat wl-clipboard \
+
+# Check if mpv is already installed
+if command -v mpv &> /dev/null; then
+    echo -e "${GREEN}✓ mpv already installed${RESET}"
+    MPV_INSTALL=""
+else
+    echo -e "${YELLOW}mpv not found, will install${RESET}"
+    MPV_INSTALL="mpv"
+fi
+
+sudo apt install -y pipx $MPV_INSTALL xsel yad socat wl-clipboard \
                     python3-gi python3-gi-cairo gir1.2-gtk-4.0 gir1.2-adw-1
 echo -e "${GREEN}✓ System packages ready${RESET}"
 echo ""
