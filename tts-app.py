@@ -12,14 +12,99 @@ import shutil
 import signal
 import socket as _sock
 import subprocess
+import glob
+import tempfile
 import threading
+import time
 from enum import Enum, auto
+from threading import Lock, Event
+
+try:
+    import pystray
+    from PIL import Image, ImageDraw
+    _HAS_TRAY = True
+except Exception:
+    _HAS_TRAY = False
 
 SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH = os.path.join(SCRIPT_DIR, 'config.json')
+CONFIG_PATH = os.path.join(SCRIPT_DIR, 'config.json')   # voice catalog only (read-only)
 SPEAK_SH    = os.path.join(SCRIPT_DIR, 'speak.sh')
-MPV_SOCKET  = '/tmp/mpvsocket'
-WORK_DIR    = '/tmp/tts_work'
+
+# Single source of truth for user settings — shared with speak.sh / tts-settings.sh
+SHELL_CFG_DIR = os.path.expanduser('~/.config/tts_settings')
+
+
+def read_setting(name: str, default: str) -> str:
+    """Read one setting file from ~/.config/tts_settings, with fallback."""
+    try:
+        with open(os.path.join(SHELL_CFG_DIR, name)) as f:
+            value = f.read().strip()
+        return value if value else default
+    except OSError:
+        return default
+
+
+def read_rate(name: str, default: int) -> int:
+    """Parse a '+50%'-style rate file into an int, clamped to 0–100."""
+    raw = read_setting(name, f'+{default}%').strip('+%')
+    try:
+        return max(0, min(100, int(raw)))
+    except ValueError:
+        return default
+
+
+def read_global_speed(default: float = 1.5) -> float:
+    """Parse the global_speed file into a float, clamped to 0.5–3.0."""
+    try:
+        return max(0.5, min(3.0, float(read_setting('global_speed', str(default)))))
+    except ValueError:
+        return default
+
+
+def read_bool_setting(name: str, default: bool = False) -> bool:
+    """Read a yes/no setting file and return a bool."""
+    raw = read_setting(name, 'yes' if default else 'no').lower().strip()
+    return raw in ('yes', 'true', '1', 'on')
+
+
+# ── Language data ────────────────────────────────────────────────────────────
+
+SOURCE_LANGUAGES = [
+    ('auto', 'Auto-detect'),
+    ('en',   'English'),
+    ('ar',   'Arabic'),
+    ('de',   'German'),
+]
+
+TRANSLATION_LANGUAGES = [
+    ('',    'None'),
+    ('en',  'English'),
+    ('ar',  'Arabic'),
+    ('de',  'German'),
+    ('fr',  'French'),
+    ('es',  'Spanish'),
+    ('pt',  'Portuguese'),
+    ('it',  'Italian'),
+    ('nl',  'Dutch'),
+    ('ru',  'Russian'),
+    ('zh',  'Chinese'),
+    ('ja',  'Japanese'),
+    ('ko',  'Korean'),
+    ('tr',  'Turkish'),
+    ('pl',  'Polish'),
+    ('hi',  'Hindi'),
+]
+
+TRANSLATION_PROVIDERS = [
+    ('deepl',  'DeepL'),
+    ('google', 'Google Cloud'),
+]
+
+# Use system temp directory for portability
+TEMP_DIR = tempfile.gettempdir()
+MPV_SOCKET  = os.path.join(TEMP_DIR, 'speak-aloud-mpv.sock')
+WORK_DIR    = os.path.join(TEMP_DIR, 'speak-aloud-work')
+SAVED_DIR   = os.path.join(TEMP_DIR, 'speak-aloud-saved')  # snapshot for "Save Audio"
 MAX_CHARS   = 5000
 
 DEFAULT_CONFIG = {
@@ -34,12 +119,11 @@ DEFAULT_CONFIG = {
             {'id': 'ar-SA-ZariyahNeural', 'name': 'Zariyah (Saudi)'},
             {'id': 'ar-EG-SalmaNeural',   'name': 'Salma (Egypt)'},
         ],
-    },
-    'selected': {
-        'english_voice_index': 0,
-        'arabic_voice_index':  0,
-        'english_speed': 50,
-        'arabic_speed':  30,
+        'german': [
+            {'id': 'de-DE-ConradNeural',  'name': 'Conrad (DE)'},
+            {'id': 'de-DE-KatjaNeural',   'name': 'Katja (DE)'},
+            {'id': 'de-DE-KillianNeural', 'name': 'Killian (DE)'},
+        ],
     },
 }
 
@@ -83,6 +167,8 @@ class TTSManager:
         self._session  = 0
         self._on_state = on_state_change
         self._on_error = on_error
+        self._lock     = Lock()  # Thread synchronization
+        self._shutdown = Event()  # Shutdown signal
         atexit.register(self._hard_kill)
 
     # ── Public API ────────────────────────────────────────────────────────────
@@ -157,6 +243,53 @@ class TTSManager:
                 pass
         threading.Thread(target=_do, daemon=True).start()
 
+    def send_mpv_query(self, command: list) -> dict | None:
+        """Send command and return mpv's JSON response."""
+        s = None
+        try:
+            s = _sock.socket(_sock.AF_UNIX, _sock.SOCK_STREAM)
+            s.settimeout(1.0)
+            s.connect(MPV_SOCKET)
+            s.sendall((json.dumps({'command': command}) + '\n').encode())
+            s.settimeout(2.0)
+            buf = b''
+            while True:
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                buf += chunk
+                for raw in buf.split(b'\n'):
+                    if not raw:
+                        continue
+                    try:
+                        resp = json.loads(raw.decode())
+                        if 'error' in resp:
+                            return resp
+                    except json.JSONDecodeError:
+                        continue
+            return None
+        except Exception:
+            return None
+        finally:
+            if s:
+                try:
+                    s.close()
+                except Exception:
+                    pass
+
+    def get_mpv_state(self) -> dict | None:
+        """Returns {position, duration, paused} or None if mpv is not running."""
+        pos_resp = self.send_mpv_query(['get_property', 'time-pos'])
+        if not pos_resp or pos_resp.get('error') != 'success':
+            return None
+        dur_resp = self.send_mpv_query(['get_property', 'duration'])
+        pause_resp = self.send_mpv_query(['get_property', 'pause'])
+        return {
+            'position': pos_resp.get('data', 0) or 0,
+            'duration': dur_resp.get('data', 0) or 0 if dur_resp else 0,
+            'paused': pause_resp.get('data', False) if pause_resp else False,
+        }
+
     # ── Background stdout reader ──────────────────────────────────────────────
 
     def _stdout_reader(self, proc, session: int) -> None:
@@ -193,7 +326,8 @@ class TTSManager:
         if session != self._session:
             return GLib.SOURCE_REMOVE   # user already stopped this session
         self._proc = None
-        threading.Thread(target=self._cleanup, daemon=True).start()
+        # NOTE: do NOT auto-cleanup here — work dir is needed for "Save Audio"
+        # and will be cleaned up by speak.sh on the next session start.
         if rc != 0:
             self._on_error('speak.sh exited with an error.\n'
                            'Check your internet connection.')
@@ -208,8 +342,19 @@ class TTSManager:
         self._proc = None
         if proc and proc.poll() is None:
             try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)  # immediate
-                proc.wait(timeout=0.5)   # SIGKILL is unblockable; <5 ms in practice
+                # Ask speak.sh to release its flock gracefully before SIGKILL
+                s = _sock.socket(_sock.AF_UNIX, _sock.SOCK_STREAM)
+                s.settimeout(0.2)
+                s.connect(MPV_SOCKET)
+                s.sendall(b'{"command":["quit"]}\n')
+                s.close()
+            except Exception:
+                pass
+            try:
+                # start_new_session=True puts speak.sh AND its mpv child in
+                # their own process group — killpg stops the audio too.
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                proc.wait(timeout=0.5)
             except (subprocess.TimeoutExpired, ProcessLookupError, OSError):
                 pass
         # Remove stale socket so the new mpv can bind to it
@@ -220,11 +365,8 @@ class TTSManager:
 
     @staticmethod
     def _cleanup() -> None:
-        """Kill only our mpv instance, delete socket, remove work dir."""
-        subprocess.run(
-            ['pkill', '-f', f'input-ipc-server={MPV_SOCKET}'],
-            capture_output=True,
-        )
+        """Delete socket, remove work dir."""
+        # No killing - speak.sh handles its own mpv via the lock
         try:
             os.unlink(MPV_SOCKET)
         except (FileNotFoundError, OSError):
@@ -237,16 +379,10 @@ class TTSManager:
             proc = self._proc
             if proc and proc.poll() is None:
                 try:
+                    # Kill the whole group (speak.sh + mpv) on app exit
                     os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
                 except (ProcessLookupError, OSError):
                     pass
-            try:
-                subprocess.run(
-                    ['pkill', '-f', f'input-ipc-server={MPV_SOCKET}'],
-                    timeout=2, capture_output=True,
-                )
-            except Exception:
-                pass
             try:
                 os.unlink(MPV_SOCKET)
             except Exception:
@@ -273,7 +409,8 @@ class TTSWindow(Adw.ApplicationWindow):
         self.set_title('Speak a Loud')
         self.set_default_size(440, 620)
 
-        # Config with graceful fallback so a missing/corrupt file doesn't crash
+        # Voice catalog with graceful fallback so a missing/corrupt file doesn't crash.
+        # User selections live in ~/.config/tts_settings (shared with CLI tools).
         try:
             with open(CONFIG_PATH) as f:
                 self.config = json.load(f)
@@ -282,15 +419,23 @@ class TTSWindow(Adw.ApplicationWindow):
 
         self._state     = AppState.IDLE
         self._is_paused = False
+        self._has_audio = False  # Track if audio was successfully generated
+        self._global_speed_value = 1.5  # Plain value for tray thread safety
         self._manager   = TTSManager(
             on_state_change=self._set_state,
             on_error=self._show_error,
         )
+        self._tray_shutdown = Event()  # Coordinate tray shutdown
 
         self._build_ui()
         self._load_saved_settings()
         self.connect('close-request', self._on_close_request)
         GLib.idle_add(self._check_wayland_clipboard)
+
+        # Start system-tray icon in background thread
+        self._tray_icon = None
+        self._tray_thread = threading.Thread(target=self._run_tray, daemon=True)
+        self._tray_thread.start()
 
     # ── UI construction ───────────────────────────────────────────────────────
 
@@ -304,6 +449,11 @@ class TTSWindow(Adw.ApplicationWindow):
                               tooltip_text='Grab highlighted text (refresh preview)')
         grab_btn.connect('clicked', self._on_grab_clicked)
         hb.pack_start(grab_btn)
+
+        cache_btn = Gtk.Button(icon_name='edit-clear-all-symbolic',
+                               tooltip_text='Clear audio cache')
+        cache_btn.connect('clicked', self._on_clear_cache)
+        hb.pack_end(cache_btn)
         tv.add_top_bar(hb)
 
         scroll = Gtk.ScrolledWindow(vexpand=True,
@@ -357,8 +507,13 @@ class TTSWindow(Adw.ApplicationWindow):
         self._ar_combo.set_model(
             Gtk.StringList.new([v['name'] for v in self.config['voices']['arabic']]))
 
+        self._de_combo = Adw.ComboRow(title='German')
+        self._de_combo.set_model(
+            Gtk.StringList.new([v['name'] for v in self.config['voices']['german']]))
+
         voice_group.add(self._en_combo)
         voice_group.add(self._ar_combo)
+        voice_group.add(self._de_combo)
         root.append(voice_group)
 
         # ── Speed sliders ─────────────────────────────────────────────────────
@@ -368,9 +523,47 @@ class TTSWindow(Adw.ApplicationWindow):
 
         self._en_speed_lbl, en_row = self._make_speed_row('English', 50)
         self._ar_speed_lbl, ar_row = self._make_speed_row('Arabic',  30)
+        self._de_speed_lbl, de_row = self._make_speed_row('German',  30)
+        global_row = self._make_global_speed_row()
         speed_group.add(en_row)
         speed_group.add(ar_row)
+        speed_group.add(de_row)
+        speed_group.add(global_row)
         root.append(speed_group)
+
+        # ── Source language ───────────────────────────────────────────────────
+        lang_group = Adw.PreferencesGroup(title='Source Language')
+        self._source_lang_combo = Adw.ComboRow(title='Detected Language')
+        self._source_lang_combo.set_model(
+            Gtk.StringList.new([label for _, label in SOURCE_LANGUAGES]))
+        lang_group.add(self._source_lang_combo)
+        root.append(lang_group)
+
+        # ── Translation ───────────────────────────────────────────────────────
+        trans_group = Adw.PreferencesGroup(title='Translation')
+
+        self._trans_enabled = Gtk.Switch(valign=Gtk.Align.CENTER)
+        self._trans_enabled.connect('state-set', self._on_trans_enabled_changed)
+        trans_toggle = Adw.ActionRow(title='Enable Translation')
+        trans_toggle.add_suffix(self._trans_enabled)
+        trans_toggle.set_activatable_widget(self._trans_enabled)
+        trans_group.add(trans_toggle)
+
+        self._trans_provider_combo = Adw.ComboRow(title='Provider')
+        self._trans_provider_combo.set_model(
+            Gtk.StringList.new([label for _, label in TRANSLATION_PROVIDERS]))
+        trans_group.add(self._trans_provider_combo)
+
+        self._trans_target_combo = Adw.ComboRow(title='Target Language')
+        self._trans_target_combo.set_model(
+            Gtk.StringList.new([label for _, label in TRANSLATION_LANGUAGES]))
+        trans_group.add(self._trans_target_combo)
+
+        self._trans_api_entry = Adw.PasswordEntryRow(title='API Key')
+        self._trans_api_entry.set_show_apply_button(False)
+        trans_group.add(self._trans_api_entry)
+
+        root.append(trans_group)
 
         # ── Controls ──────────────────────────────────────────────────────────
         btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL,
@@ -397,6 +590,12 @@ class TTSWindow(Adw.ApplicationWindow):
         self._status_lbl.add_css_class('caption')
         root.append(self._status_lbl)
 
+        # Save Audio button — shown after successful playback
+        self._save_btn = Gtk.Button(label='💾  Save Audio', visible=False)
+        self._save_btn.add_css_class('pill')
+        self._save_btn.connect('clicked', self._on_save_audio)
+        root.append(self._save_btn)
+
     def _make_speed_row(self, title: str, default: int):
         lbl = Gtk.Label(label=f'+{default}%  ({(100+default)/100:.1f}×)',
                         width_chars=12, xalign=1.0)
@@ -411,8 +610,10 @@ class TTSWindow(Adw.ApplicationWindow):
 
         if title == 'English':
             self._en_scale = scale
-        else:
+        elif title == 'Arabic':
             self._ar_scale = scale
+        else:
+            self._de_scale = scale
 
         suffix = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL,
                          spacing=8, valign=Gtk.Align.CENTER)
@@ -424,20 +625,78 @@ class TTSWindow(Adw.ApplicationWindow):
         row.set_activatable_widget(scale)
         return lbl, row
 
+    def _make_global_speed_row(self):
+        lbl = Gtk.Label(label='1.5×', width_chars=12, xalign=1.0)
+        lbl.add_css_class('dim-label')
+        self._global_speed_lbl = lbl
+
+        scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0.5, 3.0, 0.1)
+        scale.set_value(1.5)
+        scale.set_draw_value(False)
+        scale.set_hexpand(True)
+        scale.set_size_request(140, -1)
+        scale.connect('value-changed', self._on_global_speed_changed)
+        self._global_scale = scale
+
+        suffix = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL,
+                         spacing=8, valign=Gtk.Align.CENTER)
+        suffix.append(scale)
+        suffix.append(lbl)
+
+        row = Adw.ActionRow(title='Global')
+        row.add_suffix(suffix)
+        row.set_activatable_widget(scale)
+        return row
+
     def _load_saved_settings(self):
-        sel = self.config.get('selected', {})
+        """Load selections from ~/.config/tts_settings (shared with CLI tools)."""
+        def voice_index(voices, saved_id):
+            return next((i for i, v in enumerate(voices) if v['id'] == saved_id), 0)
+
         en_voices = self.config['voices']['english']
         ar_voices = self.config['voices']['arabic']
-        en_idx = min(sel.get('english_voice_index', 0), len(en_voices) - 1)
-        ar_idx = min(sel.get('arabic_voice_index',  0), len(ar_voices) - 1)
-        self._en_combo.set_selected(en_idx)
-        self._ar_combo.set_selected(ar_idx)
-        en_spd = sel.get('english_speed', 50)
-        ar_spd = sel.get('arabic_speed',  30)
+        de_voices = self.config['voices']['german']
+        self._en_combo.set_selected(
+            voice_index(en_voices, read_setting('voice', 'en-US-ChristopherNeural')))
+        self._ar_combo.set_selected(
+            voice_index(ar_voices, read_setting('arabic_voice', 'ar-SA-HamedNeural')))
+        self._de_combo.set_selected(
+            voice_index(de_voices, read_setting('german_voice', 'de-DE-ConradNeural')))
+
+        en_spd = read_rate('rate', 50)
+        ar_spd = read_rate('arabic_rate', 30)
+        de_spd = read_rate('german_rate', 30)
         self._en_scale.set_value(en_spd)
         self._ar_scale.set_value(ar_spd)
+        self._de_scale.set_value(de_spd)
         self._en_speed_lbl.set_label(f'+{en_spd}%  ({(100+en_spd)/100:.1f}×)')
         self._ar_speed_lbl.set_label(f'+{ar_spd}%  ({(100+ar_spd)/100:.1f}×)')
+        self._de_speed_lbl.set_label(f'+{de_spd}%  ({(100+de_spd)/100:.1f}×)')
+
+        global_spd = read_global_speed()
+        self._global_speed_value = global_spd
+        self._global_scale.set_value(global_spd)
+        self._global_speed_lbl.set_label(f'{global_spd:.1f}×')
+
+        # Source language
+        saved_src = read_setting('source_language', 'auto')
+        src_idx = next((i for i, (code, _) in enumerate(SOURCE_LANGUAGES) if code == saved_src), 0)
+        self._source_lang_combo.set_selected(src_idx)
+
+        # Translation
+        trans_enabled = read_bool_setting('translate_enabled', False)
+        self._trans_enabled.set_active(trans_enabled)
+        self._on_trans_enabled_changed(self._trans_enabled, trans_enabled)
+
+        prov_saved = read_setting('translate_provider', 'deepl')
+        prov_idx = next((i for i, (code, _) in enumerate(TRANSLATION_PROVIDERS) if code == prov_saved), 0)
+        self._trans_provider_combo.set_selected(prov_idx)
+
+        tgt_saved = read_setting('translate_target', '')
+        tgt_idx = next((i for i, (code, _) in enumerate(TRANSLATION_LANGUAGES) if code == tgt_saved), 0)
+        self._trans_target_combo.set_selected(tgt_idx)
+
+        self._trans_api_entry.set_text(read_setting('translate_api_key', ''))
 
     # ── State machine ─────────────────────────────────────────────────────────
 
@@ -457,6 +716,16 @@ class TTSWindow(Adw.ApplicationWindow):
         if state == AppState.IDLE:
             self._is_paused = False
             self._pause_btn.set_label('⏸  Pause')
+            # Only show save button if we actually have audio
+            self._save_btn.set_visible(self._has_audio)
+        elif state == AppState.GENERATING:
+            self._has_audio = False  # Reset audio flag when starting new generation
+            self._save_btn.set_visible(False)
+        elif state == AppState.PLAYING:
+            self._has_audio = True  # We have audio when playing starts
+            # Snapshot the segments now — speak.sh wipes WORK_DIR on its next
+            # run, so "Save Audio" must not depend on it surviving.
+            self._snapshot_segments()
 
     # ── Signal handlers ───────────────────────────────────────────────────────
 
@@ -484,10 +753,18 @@ class TTSWindow(Adw.ApplicationWindow):
         if self._state == AppState.PLAYING:
             self._manager.send_mpv(['set_property', 'speed', round(mpv_speed, 3)])
 
-    def _on_close_request(self, _win) -> bool:
-        # shutdown() sends SIGTERM but does NOT wait — window closes instantly
-        self._manager.shutdown()
-        return False
+    def _on_global_speed_changed(self, scale):
+        speed = round(scale.get_value(), 3)
+        self._global_speed_value = speed
+        self._global_speed_lbl.set_label(f'{speed:.1f}×')
+        if self._state == AppState.PLAYING:
+            self._manager.send_mpv(['set_property', 'speed', speed])
+
+    def _on_trans_enabled_changed(self, switch, state):
+        self._trans_provider_combo.set_sensitive(state)
+        self._trans_target_combo.set_sensitive(state)
+        self._trans_api_entry.set_sensitive(state)
+        return False  # let GTK propagate the state change
 
     # ── Async selection helpers ───────────────────────────────────────────────
 
@@ -533,24 +810,43 @@ class TTSWindow(Adw.ApplicationWindow):
     def _start_speaking(self, text: str):
         en_idx   = self._en_combo.get_selected()
         ar_idx   = self._ar_combo.get_selected()
+        de_idx   = self._de_combo.get_selected()
         en_voice = self.config['voices']['english'][en_idx]['id']
         ar_voice = self.config['voices']['arabic'][ar_idx]['id']
+        de_voice = self.config['voices']['german'][de_idx]['id']
         en_rate  = f"+{int(self._en_scale.get_value())}%"
         ar_rate  = f"+{int(self._ar_scale.get_value())}%"
-        speed    = round((100 + int(self._en_scale.get_value())) / 100, 3)
+        de_rate  = f"+{int(self._de_scale.get_value())}%"
+        speed    = round(self._global_scale.get_value(), 3)
 
-        self._save_settings(en_idx, ar_idx)
+        src_lang = SOURCE_LANGUAGES[self._source_lang_combo.get_selected()][0]
+        trans_enabled = 'yes' if self._trans_enabled.get_active() else 'no'
+        trans_provider = TRANSLATION_PROVIDERS[self._trans_provider_combo.get_selected()][0]
+        trans_target = TRANSLATION_LANGUAGES[self._trans_target_combo.get_selected()][0]
+        trans_key = self._trans_api_entry.get_text()
+
+        self._save_settings(en_idx, ar_idx, de_idx, src_lang, trans_enabled, trans_provider, trans_target, trans_key)
         self._set_state(AppState.GENERATING)   # instant feedback before first STATUS line
 
-        self._manager.speak([
+        cmd = [
             'bash', SPEAK_SH,
             '--text',     text,
             '--en-voice', en_voice,
             '--ar-voice', ar_voice,
+            '--de-voice', de_voice,
             '--en-rate',  en_rate,
             '--ar-rate',  ar_rate,
+            '--de-rate',  de_rate,
             '--speed',    str(speed),
-        ])
+            '--source-lang', src_lang,
+            '--translate-enabled', trans_enabled,
+            '--translate-provider', trans_provider,
+        ]
+        if trans_target:
+            cmd += ['--translate-target', trans_target]
+        if trans_key:
+            cmd += ['--translate-api-key', trans_key]
+        self._manager.speak(cmd)
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -567,38 +863,135 @@ class TTSWindow(Adw.ApplicationWindow):
             dialog.present()
         return GLib.SOURCE_REMOVE
 
-    def _save_settings(self, en_idx: int, ar_idx: int):
+    def _save_settings(self, en_idx: int, ar_idx: int, de_idx: int,
+                       src_lang: str = 'auto',
+                       trans_enabled: str = 'no',
+                       trans_provider: str = 'deepl',
+                       trans_target: str = '',
+                       trans_key: str = ''):
+        """Persist all selections to ~/.config/tts_settings (single source of truth)."""
         en_rate = int(self._en_scale.get_value())
         ar_rate = int(self._ar_scale.get_value())
+        de_rate = int(self._de_scale.get_value())
         en_voice = self.config['voices']['english'][en_idx]['id']
         ar_voice = self.config['voices']['arabic'][ar_idx]['id']
+        de_voice = self.config['voices']['german'][de_idx]['id']
+        global_speed = round(self._global_scale.get_value(), 3)
 
-        # 1. Save to internal config.json (for GUI app state)
-        self.config.setdefault('selected', {})
-        self.config['selected']['english_voice_index'] = en_idx
-        self.config['selected']['arabic_voice_index']  = ar_idx
-        self.config['selected']['english_speed'] = en_rate
-        self.config['selected']['arabic_speed']  = ar_rate
+        settings = {
+            'voice':        en_voice,
+            'arabic_voice': ar_voice,
+            'german_voice': de_voice,
+            'rate':         f'+{en_rate}%',
+            'arabic_rate':  f'+{ar_rate}%',
+            'german_rate':  f'+{de_rate}%',
+            'global_speed': str(global_speed),
+            'source_language': src_lang,
+            'translate_enabled': trans_enabled,
+            'translate_provider': trans_provider,
+            'translate_target': trans_target,
+            'translate_api_key': trans_key,
+        }
         try:
-            with open(CONFIG_PATH, 'w') as f:
-                json.dump(self.config, f, indent=2)
+            os.makedirs(SHELL_CFG_DIR, exist_ok=True)
+            for name, value in settings.items():
+                with open(os.path.join(SHELL_CFG_DIR, name), 'w') as f:
+                    f.write(value)
         except OSError:
             pass
 
-        # 2. Sync to ~/.config/tts_settings (for speak.sh / shortcut mode)
-        shell_cfg = os.path.expanduser('~/.config/tts_settings')
+    @staticmethod
+    def _snapshot_segments():
+        import glob
         try:
-            os.makedirs(shell_cfg, exist_ok=True)
-            with open(os.path.join(shell_cfg, 'voice'), 'w') as f:
-                f.write(en_voice)
-            with open(os.path.join(shell_cfg, 'arabic_voice'), 'w') as f:
-                f.write(ar_voice)
-            with open(os.path.join(shell_cfg, 'rate'), 'w') as f:
-                f.write(f"+{en_rate}%")
-            with open(os.path.join(shell_cfg, 'arabic_rate'), 'w') as f:
-                f.write(f"+{ar_rate}%")
+            shutil.rmtree(SAVED_DIR, ignore_errors=True)
+            os.makedirs(SAVED_DIR, exist_ok=True)
+            for seg in sorted(glob.glob(f'{WORK_DIR}/seg_*.mp3')):
+                shutil.copy(seg, SAVED_DIR)
         except OSError:
             pass
+
+    def _on_save_audio(self, _btn):
+        dialog = Gtk.FileDialog()
+        dialog.set_title('Save Audio')
+        dialog.set_initial_name('tts_output.mp3')
+        filter_mp3 = Gtk.FileFilter()
+        filter_mp3.add_suffix('mp3')
+        filter_mp3.set_name('MP3 audio')
+        dialog.set_default_filter(filter_mp3)
+        dialog.save(self, None, self._on_save_dialog_result)
+
+    def _on_save_dialog_result(self, dialog, result):
+        try:
+            file = dialog.save_finish(result)
+            if file is None:
+                return
+            dest = file.get_path()
+            # Concatenate all segment MP3s to the destination.
+            # Prefer the snapshot dir (immune to speak.sh's work-dir cleanup).
+            segments = sorted(glob.glob(f'{SAVED_DIR}/seg_*.mp3'))
+            if not segments:
+                segments = sorted(glob.glob(f'{WORK_DIR}/seg_*.mp3'))
+            if not segments:
+                self._show_error('No audio files found to save.')
+                return
+            
+            # Validate that all segment files exist and are readable
+            valid_segments = []
+            for seg in segments:
+                if os.path.isfile(seg) and os.access(seg, os.R_OK) and os.path.getsize(seg) > 0:
+                    valid_segments.append(seg)
+                else:
+                    print(f"Warning: Skipping invalid segment file: {seg}")
+            
+            if not valid_segments:
+                self._show_error('No valid audio files found to save.')
+                return
+                
+            if len(valid_segments) == 1:
+                shutil.copy(valid_segments[0], dest)
+            else:
+                # Use ffmpeg concat if available, else cat (best-effort)
+                ffmpeg = shutil.which('ffmpeg')
+                if ffmpeg:
+                    with tempfile.NamedTemporaryFile(
+                            'w', suffix='.txt', delete=False) as f:
+                        list_file = f.name
+                        for seg in valid_segments:
+                            f.write(f"file '{seg}'\n")
+                    try:
+                        subprocess.run([ffmpeg, '-y', '-f', 'concat', '-safe', '0',
+                                        '-i', list_file, '-c', 'copy', dest],
+                                       capture_output=True, check=True)
+                    finally:
+                        os.remove(list_file)
+                else:
+                    # Fallback: cat MP3s (works in most players for sequential files)
+                    with open(dest, 'wb') as out:
+                        for seg in valid_segments:
+                            with open(seg, 'rb') as inp:
+                                out.write(inp.read())
+            self._show_notification(f'Saved audio to {dest}')
+        except Exception as e:
+            self._show_error(f'Failed to save audio: {e}')
+
+    def _on_clear_cache(self, _btn):
+        cache_dir = os.path.expanduser('~/.cache/speak-aloud')
+        try:
+            count = 0
+            for f in os.listdir(cache_dir):
+                if f.endswith('.mp3'):
+                    os.remove(os.path.join(cache_dir, f))
+                    count += 1
+            self._show_notification(f'Cleared {count} cached audio files')
+        except Exception as e:
+            self._show_error(f'Failed to clear cache: {e}')
+
+    def _show_notification(self, message: str) -> None:
+        dialog = Adw.MessageDialog(
+            transient_for=self, heading='Speak a Loud', body=message)
+        dialog.add_response('ok', 'OK')
+        dialog.present()
 
     def _show_error(self, message: str) -> None:
         dialog = Adw.MessageDialog(
@@ -616,6 +1009,135 @@ class TTSWindow(Adw.ApplicationWindow):
         )
         dialog.add_response('ok', 'OK')
         dialog.present()
+
+    # ── Tray icon ─────────────────────────────────────────────────────────────
+
+    def _run_tray(self):
+        if not _HAS_TRAY:
+            return
+        try:
+            icon = pystray.Icon(
+                'speak-aloud',
+                icon=self._create_tray_image(),
+                title='Speak a Loud',
+                menu=self._build_tray_menu(),
+            )
+            self._tray_icon = icon
+            icon.run()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _create_tray_image():
+        # Simple microphone-style icon: blue circle on white
+        width, height = 64, 64
+        image = Image.new('RGBA', (width, height), (255, 255, 255, 0))
+        dc = ImageDraw.Draw(image)
+        dc.ellipse([4, 4, width - 4, height - 4], fill=(66, 133, 244, 255))
+        dc.ellipse([20, 20, width - 20, height - 20], fill=(255, 255, 255, 255))
+        dc.ellipse([24, 24, width - 24, height - 24], fill=(66, 133, 244, 255))
+        return image
+
+    def _build_tray_menu(self):
+        def on_toggle(icon, _item):
+            if not self._tray_shutdown.is_set():
+                GLib.idle_add(self._manager.send_mpv, ['cycle', 'pause'])
+
+        def on_stop(icon, _item):
+            if not self._tray_shutdown.is_set():
+                GLib.idle_add(self._manager.kill)
+
+        def on_show(icon, _item):
+            if not self._tray_shutdown.is_set():
+                GLib.idle_add(self.present)
+
+        def on_quit(icon, _item):
+            self._tray_shutdown.set()
+            icon.stop()
+            GLib.idle_add(self._quit_app)
+
+        def on_speed(speed):
+            def _apply():
+                self._global_scale.set_value(speed)
+                self._persist_global_speed(speed)
+                self._manager.send_mpv(['set_property', 'speed', round(speed, 2)])
+                return GLib.SOURCE_REMOVE
+
+            def _fn(icon, _item):
+                if not self._tray_shutdown.is_set():
+                    GLib.idle_add(_apply)
+            return _fn
+
+        def on_seek(offset):
+            def _fn(icon, _item):
+                if not self._tray_shutdown.is_set():
+                    state = self._manager.get_mpv_state()
+                    if state:
+                        new_pos = max(0, state['position'] + offset)
+                        self._manager.send_mpv(['set_property', 'time-pos', new_pos])
+            return _fn
+
+        speeds = [0.5, 1.0, 1.25, 1.5, 2.0, 2.5]
+        speed_items = [
+            pystray.MenuItem(
+                f'{s}×',
+                on_speed(s),
+                # Read the live slider so the checkmark follows speed changes
+                checked=lambda item, s=s: abs(
+                    self._global_speed_value - s
+                ) < 0.01,
+            )
+            for s in speeds
+        ]
+
+        return pystray.Menu(
+            pystray.MenuItem('Show TTS App', on_show),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem(lambda item: self._tray_play_text(), on_toggle),
+            pystray.MenuItem('⏹  Stop', on_stop),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem('Speed', pystray.Menu(*speed_items)),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem('⏪  -10s', on_seek(-10)),
+            pystray.MenuItem('⏩  +10s', on_seek(10)),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem('Quit', on_quit),
+        )
+
+    def _tray_play_text(self) -> str:
+        state = self._manager.get_mpv_state()
+        if not state:
+            return '▶  Play'
+        return '⏸  Pause' if not state.get('paused') else '▶  Play'
+
+    def _persist_global_speed(self, speed: float):
+        self._global_speed_value = speed
+        try:
+            os.makedirs(SHELL_CFG_DIR, exist_ok=True)
+            with open(os.path.join(SHELL_CFG_DIR, 'global_speed'), 'w') as f:
+                f.write(str(round(speed, 3)))
+        except OSError:
+            pass
+
+    def _quit_app(self):
+        self._tray_shutdown.set()  # Signal tray thread to stop
+        self._manager.shutdown()
+        if self._tray_icon:
+            self._tray_icon.stop()
+        # Give tray thread a moment to clean up
+        if self._tray_thread.is_alive():
+            self._tray_thread.join(timeout=1.0)
+        self.get_application().quit()
+
+    # ── Override close to hide to tray ────────────────────────────────────────
+
+    def _on_close_request(self, _win) -> bool:
+        if _HAS_TRAY:
+            # Hide to tray — keep playback and the manager alive
+            self.set_visible(False)
+            return True   # do NOT destroy window, just hide
+        self._manager.shutdown()
+        return False
 
 
 # ─────────────────────────────────────────────────────────────────────────────

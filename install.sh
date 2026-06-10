@@ -13,7 +13,6 @@ CYAN="\033[1;36m"
 RESET="\033[0m"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-USERNAME="$(whoami)"
 
 echo ""
 echo -e "${CYAN}${BOLD}╔══════════════════════════════════════════╗${RESET}"
@@ -22,7 +21,7 @@ echo -e "${CYAN}${BOLD}╚══════════════════
 echo ""
 
 # ── Step 1: System packages ──────────────────
-echo -e "${BOLD}[1/5] Installing system dependencies...${RESET}"
+echo -e "${BOLD}[1/6] Installing system dependencies...${RESET}"
 sudo apt update -qq
 
 # Check if mpv is already installed
@@ -34,42 +33,72 @@ else
     MPV_INSTALL="mpv"
 fi
 
-sudo apt install -y pipx $MPV_INSTALL xsel yad socat wl-clipboard \
-                    python3-gi python3-gi-cairo gir1.2-gtk-4.0 gir1.2-adw-1
-echo -e "${GREEN}✓ System packages ready${RESET}"
-echo ""
+# Install packages with validation
+PACKAGES=(pipx xsel yad socat wl-clipboard python3-gi python3-gi-cairo gir1.2-gtk-4.0 gir1.2-adw-1 python3-pil)
+[ -n "$MPV_INSTALL" ] && PACKAGES+=("$MPV_INSTALL")
+echo "Installing packages: ${PACKAGES[*]}"
+
+if sudo apt install -y "${PACKAGES[@]}"; then
+    echo -e "${GREEN}✓ System packages installed successfully${RESET}"
+else
+    echo -e "${YELLOW}⚠ Some packages may have failed to install${RESET}"
+    # Check critical packages
+    MISSING_CRITICAL=""
+    for pkg in pipx mpv xsel; do
+        if ! command -v "$pkg" &>/dev/null; then
+            MISSING_CRITICAL="$MISSING_CRITICAL $pkg"
+        fi
+    done
+    if [ -n "$MISSING_CRITICAL" ]; then
+        echo -e "${YELLOW}⚠ Critical packages missing:$MISSING_CRITICAL${RESET}"
+        echo -e "Please install them manually: ${CYAN}sudo apt install$MISSING_CRITICAL${RESET}"
+    fi
+fi
 
 # ── Step 2: edge-tts ─────────────────────────
-echo -e "${BOLD}[2/5] Installing edge-tts...${RESET}"
+echo -e "${BOLD}[2/6] Installing edge-tts...${RESET}"
 pipx ensurepath --force > /dev/null 2>&1
 export PATH="$HOME/.local/bin:$PATH"
 pipx install edge-tts 2>/dev/null || pipx upgrade edge-tts
 echo -e "${GREEN}✓ edge-tts ready${RESET}"
+
+# Optional: pystray for the system-tray icon (GUI app degrades gracefully without it)
+if ! python3 -c "import pystray" 2>/dev/null; then
+    echo "Installing pystray (system-tray support)..."
+    python3 -m pip install --user pystray 2>/dev/null \
+        || python3 -m pip install --user --break-system-packages pystray 2>/dev/null \
+        || echo -e "${YELLOW}⚠ pystray install failed — tray icon will be disabled (GUI still works)${RESET}"
+fi
 echo ""
 
 # ── Step 3: Config files ─────────────────────
-echo -e "${BOLD}[3/5] Setting up config files...${RESET}"
+echo -e "${BOLD}[3/6] Setting up config files...${RESET}"
 mkdir -p ~/.config/tts_settings
 
 [ ! -f ~/.config/tts_settings/voice ]        && echo "en-US-ChristopherNeural" > ~/.config/tts_settings/voice
 [ ! -f ~/.config/tts_settings/arabic_voice ] && echo "ar-SA-HamedNeural"       > ~/.config/tts_settings/arabic_voice
+[ ! -f ~/.config/tts_settings/german_voice ] && echo "de-DE-ConradNeural"      > ~/.config/tts_settings/german_voice
 [ ! -f ~/.config/tts_settings/rate ]         && echo "+50%"                    > ~/.config/tts_settings/rate
 [ ! -f ~/.config/tts_settings/arabic_rate ]  && echo "+30%"                    > ~/.config/tts_settings/arabic_rate
+[ ! -f ~/.config/tts_settings/german_rate ]  && echo "+30%"                    > ~/.config/tts_settings/german_rate
+[ ! -f ~/.config/tts_settings/global_speed ] && echo "1.5"                     > ~/.config/tts_settings/global_speed
 
 echo -e "${GREEN}✓ Config files ready at ~/.config/tts_settings/${RESET}"
 echo ""
 
 # ── Step 4: Make scripts executable ──────────
-echo -e "${BOLD}[4/5] Setting permissions...${RESET}"
+echo -e "${BOLD}[4/6] Setting permissions...${RESET}"
 chmod +x "$SCRIPT_DIR/speak.sh"
 chmod +x "$SCRIPT_DIR/speak-pause.sh"
+chmod +x "$SCRIPT_DIR/speak-stop.sh"
 chmod +x "$SCRIPT_DIR/tts-settings.sh"
 chmod +x "$SCRIPT_DIR/tts-app.py"
+chmod +x "$SCRIPT_DIR/setup-tts-shortcuts.sh"
 echo -e "${GREEN}✓ Scripts are executable${RESET}"
 echo ""
 
 # ── Step 5: Verify GTK4 / Libadwaita ─────────
-echo -e "${BOLD}[5/5] Verifying GTK4 + Libadwaita Python bindings...${RESET}"
+echo -e "${BOLD}[5/6] Verifying GTK4 + Libadwaita Python bindings...${RESET}"
 MISSING=0
 if ! python3 -c "import gi; gi.require_version('Gtk', '4.0')" 2>/dev/null; then
     echo -e "${YELLOW}⚠ GTK 4.0 Python bindings not found.${RESET}"
@@ -88,6 +117,76 @@ else
 fi
 echo ""
 
+# ── Step 6: Keyboard shortcuts (Cinnamon) ────
+echo -e "${BOLD}[6/6] Keyboard shortcuts...${RESET}"
+
+SHORTCUTS_CONFIGURED=0
+
+add_or_update_shortcut() {
+    local name="$1" command="$2" binding="$3"
+    local schema="org.cinnamon.desktop.keybindings"
+    local list slot num existing_cmd
+
+    list=$(gsettings get "$schema" custom-list)
+
+    # Look for an existing slot with the same command (idempotent update)
+    for slot in $(echo "$list" | grep -o "custom[0-9]*"); do
+        local path="/org/cinnamon/desktop/keybindings/custom-keybindings/${slot}/"
+        existing_cmd=$(gsettings get "${schema}.custom-keybinding:${path}" command 2>/dev/null | sed "s/^'//;s/'$//")
+        if [ "$existing_cmd" = "$command" ]; then
+            gsettings set "${schema}.custom-keybinding:${path}" name "$name"
+            gsettings set "${schema}.custom-keybinding:${path}" binding "$binding"
+            echo -e "  ${GREEN}✓ Updated:${RESET} $name (${slot})"
+            return 0
+        fi
+    done
+
+    # Find next free slot number
+    num=0
+    while echo "$list" | grep -q "'custom${num}'"; do
+        num=$((num + 1))
+    done
+    slot="custom${num}"
+
+    local path="/org/cinnamon/desktop/keybindings/custom-keybindings/${slot}/"
+    gsettings set "${schema}.custom-keybinding:${path}" name "$name"
+    gsettings set "${schema}.custom-keybinding:${path}" command "$command"
+    gsettings set "${schema}.custom-keybinding:${path}" binding "$binding"
+
+    # Append slot to custom-list
+    if [ "$list" = "[]" ] || [ "$list" = "@as []" ]; then
+        gsettings set "$schema" custom-list "['${slot}']"
+    else
+        local replacement=", '${slot}']"
+        gsettings set "$schema" custom-list "${list//]/$replacement}"
+    fi
+    echo -e "  ${GREEN}✓ Added:${RESET} $name (${slot})"
+}
+
+if gsettings list-schemas 2>/dev/null | grep -q "org.cinnamon.desktop.keybindings"; then
+    echo -e "This will register these shortcuts in Cinnamon:"
+    echo -e "  ${CYAN}Super+S${RESET} Speak Selection   ${CYAN}Super+P${RESET} Pause/Resume   ${CYAN}Super+Shift+S${RESET} Stop"
+    echo -e "  ${CYAN}Super+T${RESET} TTS Settings      ${CYAN}Super+A${RESET} TTS App (GUI)"
+    read -r -p "Set up Cinnamon keyboard shortcuts automatically? [Y/n] " REPLY
+    case "$REPLY" in
+        [nN]*)
+            echo -e "${YELLOW}Skipped. You can add them manually (see table below).${RESET}"
+            ;;
+        *)
+            add_or_update_shortcut "Speak Selection"    "$SCRIPT_DIR/speak.sh"            "['<Super>s']"
+            add_or_update_shortcut "Pause / Resume"     "$SCRIPT_DIR/speak-pause.sh"      "['<Super>p']"
+            add_or_update_shortcut "Stop Speech"        "$SCRIPT_DIR/speak-stop.sh"       "['<Shift><Super>s']"
+            add_or_update_shortcut "TTS Settings (CLI)" "$SCRIPT_DIR/tts-settings.sh"     "['<Super>t']"
+            add_or_update_shortcut "TTS App (GUI)"      "python3 $SCRIPT_DIR/tts-app.py"  "['<Super>a']"
+            SHORTCUTS_CONFIGURED=1
+            echo -e "${GREEN}✓ Keyboard shortcuts configured${RESET}"
+            ;;
+    esac
+else
+    echo -e "${YELLOW}Cinnamon not detected — add shortcuts manually (see table below).${RESET}"
+fi
+echo ""
+
 # ── Done ─────────────────────────────────────
 echo -e "${GREEN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
 echo -e "${GREEN}${BOLD}  Installation complete!${RESET}"
@@ -96,18 +195,20 @@ echo ""
 echo -e "${BOLD}Run the GUI app anytime with:${RESET}"
 echo -e "  ${CYAN}python3 $SCRIPT_DIR/tts-app.py${RESET}"
 echo ""
-echo -e "${BOLD}Add these keyboard shortcuts in Linux Mint:${RESET}"
-echo -e "  ${CYAN}Mint Menu → System Settings → Keyboard → Shortcuts → Custom Shortcuts${RESET}"
-echo ""
-echo -e "  ${YELLOW}┌──────────────────────┬──────────────────────────────────────────────────────────────────┬──────────────────────┐${RESET}"
-echo -e "  ${YELLOW}│ Name                 │ Command                                                          │ Shortcut             │${RESET}"
-echo -e "  ${YELLOW}├──────────────────────┼──────────────────────────────────────────────────────────────────┼──────────────────────┤${RESET}"
-echo -e "  ${YELLOW}│ Speak Selection      │ ${RESET}/home/${USERNAME}/speak-aloud-linux/speak.sh                 ${YELLOW}│ Super + S            │${RESET}"
-echo -e "  ${YELLOW}│ Pause / Resume       │ ${RESET}/home/${USERNAME}/speak-aloud-linux/speak-pause.sh          ${YELLOW}│ Super + P            │${RESET}"
-echo -e "  ${YELLOW}│ Stop Speech          │ ${RESET}pkill -f mpv                                                ${YELLOW}│ Super + Shift + S    │${RESET}"
-echo -e "  ${YELLOW}│ TTS Settings (CLI)   │ ${RESET}/home/${USERNAME}/speak-aloud-linux/tts-settings.sh         ${YELLOW}│ Super + T            │${RESET}"
-echo -e "  ${YELLOW}│ TTS App (GUI)        │ ${RESET}python3 /home/${USERNAME}/speak-aloud-linux/tts-app.py      ${YELLOW}│ Super + A            │${RESET}"
-echo -e "  ${YELLOW}└──────────────────────┴──────────────────────────────────────────────────────────────────┴──────────────────────┘${RESET}"
+if [ "$SHORTCUTS_CONFIGURED" -eq 1 ]; then
+    echo -e "${GREEN}✓ Keyboard shortcuts are configured and ready to use.${RESET}"
+else
+    echo -e "${BOLD}Add these keyboard shortcuts in Linux Mint:${RESET}"
+    echo -e "  ${CYAN}Mint Menu → System Settings → Keyboard → Shortcuts → Custom Shortcuts${RESET}"
+    echo ""
+    echo -e "  ${YELLOW}Name                 │ Command                                          │ Shortcut${RESET}"
+    echo -e "  ${YELLOW}─────────────────────┼──────────────────────────────────────────────────┼──────────────────${RESET}"
+    echo -e "  Speak Selection      ${YELLOW}│${RESET} $SCRIPT_DIR/speak.sh ${YELLOW}│${RESET} Super + S"
+    echo -e "  Pause / Resume       ${YELLOW}│${RESET} $SCRIPT_DIR/speak-pause.sh ${YELLOW}│${RESET} Super + P"
+    echo -e "  Stop Speech          ${YELLOW}│${RESET} $SCRIPT_DIR/speak-stop.sh ${YELLOW}│${RESET} Super + Shift + S"
+    echo -e "  TTS Settings (CLI)   ${YELLOW}│${RESET} $SCRIPT_DIR/tts-settings.sh ${YELLOW}│${RESET} Super + T"
+    echo -e "  TTS App (GUI)        ${YELLOW}│${RESET} python3 $SCRIPT_DIR/tts-app.py ${YELLOW}│${RESET} Super + A"
+fi
 echo ""
 echo -e "  ${BOLD}Tips:${RESET}"
 echo -e "  • ${CYAN}Super + S${RESET}  — highlight text anywhere, press to hear it"
