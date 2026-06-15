@@ -15,13 +15,13 @@ RESET="\033[0m"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 echo ""
-echo -e "${CYAN}${BOLD}╔══════════════════════════════════════════╗${RESET}"
-echo -e "${CYAN}${BOLD}║   Speak a Loud Universal — Installer     ║${RESET}"
-echo -e "${CYAN}${BOLD}╚══════════════════════════════════════════╝${RESET}"
+echo -e "${CYAN}${BOLD}╔══════════════════════════════════════════════════╗${RESET}"
+echo -e "${CYAN}${BOLD}║   Speak a Loud Universal — One-Click Installer   ║${RESET}"
+echo -e "${CYAN}${BOLD}╚══════════════════════════════════════════════════╝${RESET}"
 echo ""
 
 # ── Step 1: System packages ──────────────────
-echo -e "${BOLD}[1/6] Installing system dependencies...${RESET}"
+echo -e "${BOLD}[1/7] Installing system dependencies...${RESET}"
 sudo apt update -qq
 
 # Check if mpv is already installed
@@ -34,7 +34,7 @@ else
 fi
 
 # Install packages with validation
-PACKAGES=(pipx xsel yad socat wl-clipboard python3-gi python3-gi-cairo gir1.2-gtk-4.0 gir1.2-adw-1 python3-pil)
+PACKAGES=(pipx xsel yad socat wl-clipboard python3-gi python3-gi-cairo gir1.2-gtk-4.0 gir1.2-adw-1 python3-pil python3-pip file)
 [ -n "$MPV_INSTALL" ] && PACKAGES+=("$MPV_INSTALL")
 echo "Installing packages: ${PACKAGES[*]}"
 
@@ -60,19 +60,30 @@ echo -e "${BOLD}[2/6] Installing edge-tts...${RESET}"
 pipx ensurepath --force > /dev/null 2>&1
 export PATH="$HOME/.local/bin:$PATH"
 pipx install edge-tts 2>/dev/null || pipx upgrade edge-tts
-echo -e "${GREEN}✓ edge-tts ready${RESET}"
+
+# Verify edge-tts is actually callable
+if command -v edge-tts &>/dev/null; then
+    echo -e "${GREEN}✓ edge-tts ready${RESET}"
+else
+    echo -e "${YELLOW}⚠ edge-tts not in PATH. You may need to:${RESET}"
+    echo -e "  ${CYAN}source ~/.profile && export PATH=\"\$HOME/.local/bin:\$PATH\"${RESET}"
+fi
 
 # Optional: pystray for the system-tray icon (GUI app degrades gracefully without it)
 if ! python3 -c "import pystray" 2>/dev/null; then
     echo "Installing pystray (system-tray support)..."
-    python3 -m pip install --user pystray 2>/dev/null \
-        || python3 -m pip install --user --break-system-packages pystray 2>/dev/null \
-        || echo -e "${YELLOW}⚠ pystray install failed — tray icon will be disabled (GUI still works)${RESET}"
+    if python3 -m pip install --user pystray 2>/dev/null; then
+        echo -e "${GREEN}✓ pystray installed (user)${RESET}"
+    elif python3 -m pip install --break-system-packages pystray 2>/dev/null; then
+        echo -e "${GREEN}✓ pystray installed (system)${RESET}"
+    else
+        echo -e "${YELLOW}⚠ pystray install failed — tray icon will be disabled (GUI still works)${RESET}"
+    fi
 fi
 echo ""
 
 # ── Step 3: Config files ─────────────────────
-echo -e "${BOLD}[3/6] Setting up config files...${RESET}"
+echo -e "${BOLD}[3/7] Setting up config files...${RESET}"
 mkdir -p ~/.config/tts_settings
 
 [ ! -f ~/.config/tts_settings/voice ]        && echo "en-US-ChristopherNeural" > ~/.config/tts_settings/voice
@@ -97,8 +108,26 @@ chmod +x "$SCRIPT_DIR/setup-tts-shortcuts.sh"
 echo -e "${GREEN}✓ Scripts are executable${RESET}"
 echo ""
 
-# ── Step 5: Verify GTK4 / Libadwaita ─────────
-echo -e "${BOLD}[5/6] Verifying GTK4 + Libadwaita Python bindings...${RESET}"
+# ── Step 5: Desktop entry ────────────────────
+echo -e "${BOLD}[5/6] Adding to app menu...${RESET}"
+DESKTOP_FILE="$HOME/.local/share/applications/speak-aloud.desktop"
+mkdir -p "$HOME/.local/share/applications"
+cat > "$DESKTOP_FILE" <<EOF
+[Desktop Entry]
+Name=Speak a Loud
+Comment=Text-to-Speech with GTK4 GUI
+Exec=python3 $SCRIPT_DIR/tts-app.py
+Icon=audio-speakers
+Type=Application
+Terminal=false
+Categories=AudioVideo;Audio;Utility;
+Keywords=tts;speech;text-to-speech;audio;read aloud;
+EOF
+echo -e "${GREEN}✓ App menu entry created${RESET}"
+echo ""
+
+# ── Step 6: Verify GTK4 / Libadwaita ─────────
+echo -e "${BOLD}[6/7] Verifying GTK4 + Libadwaita Python bindings...${RESET}"
 MISSING=0
 if ! python3 -c "import gi; gi.require_version('Gtk', '4.0')" 2>/dev/null; then
     echo -e "${YELLOW}⚠ GTK 4.0 Python bindings not found.${RESET}"
@@ -118,7 +147,7 @@ fi
 echo ""
 
 # ── Step 6: Keyboard shortcuts (Cinnamon) ────
-echo -e "${BOLD}[6/6] Keyboard shortcuts...${RESET}"
+echo -e "${BOLD}[7/7] Keyboard shortcuts...${RESET}"
 
 SHORTCUTS_CONFIGURED=0
 
@@ -183,7 +212,7 @@ if gsettings list-schemas 2>/dev/null | grep -q "org.cinnamon.desktop.keybinding
             ;;
     esac
 else
-    echo -e "${YELLOW}Cinnamon not detected — add shortcuts manually (see table below).${RESET}"
+    echo -e "${YELLOW}Cinnamon not detected — add shortcuts manually in your DE settings (see table below).${RESET}"
 fi
 echo ""
 
@@ -192,14 +221,18 @@ echo -e "${GREEN}${BOLD}━━━━━━━━━━━━━━━━━━�
 echo -e "${GREEN}${BOLD}  Installation complete!${RESET}"
 echo -e "${GREEN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
 echo ""
-echo -e "${BOLD}Run the GUI app anytime with:${RESET}"
-echo -e "  ${CYAN}python3 $SCRIPT_DIR/tts-app.py${RESET}"
+echo -e "${BOLD}Launch the app:${RESET}"
+echo -e "  • ${CYAN}App Menu → Speak a Loud${RESET} (GUI with tray icon)"
+echo -e "  • ${CYAN}python3 $SCRIPT_DIR/tts-app.py${RESET}"
 echo ""
 if [ "$SHORTCUTS_CONFIGURED" -eq 1 ]; then
-    echo -e "${GREEN}✓ Keyboard shortcuts are configured and ready to use.${RESET}"
+    echo -e "${GREEN}✓ Keyboard shortcuts are configured.${RESET}"
+    echo -e "  ${YELLOW}Log out and back in (or press Alt+F2 then type 'r') for shortcuts to activate.${RESET}"
 else
-    echo -e "${BOLD}Add these keyboard shortcuts in Linux Mint:${RESET}"
-    echo -e "  ${CYAN}Mint Menu → System Settings → Keyboard → Shortcuts → Custom Shortcuts${RESET}"
+    echo -e "${BOLD}Add these keyboard shortcuts manually:${RESET}"
+    echo -e "  ${CYAN}Linux Mint: System Settings → Keyboard → Shortcuts → Custom Shortcuts${RESET}"
+    echo -e "  ${CYAN}GNOME:      Settings → Keyboard → Keyboard Shortcuts → Custom${RESET}"
+    echo -e "  ${CYAN}KDE:        System Settings → Shortcuts → Custom Shortcuts${RESET}"
     echo ""
     echo -e "  ${YELLOW}Name                 │ Command                                          │ Shortcut${RESET}"
     echo -e "  ${YELLOW}─────────────────────┼──────────────────────────────────────────────────┼──────────────────${RESET}"
@@ -210,9 +243,9 @@ else
     echo -e "  TTS App (GUI)        ${YELLOW}│${RESET} python3 $SCRIPT_DIR/tts-app.py ${YELLOW}│${RESET} Super + A"
 fi
 echo ""
-echo -e "  ${BOLD}Tips:${RESET}"
+echo -e "  ${BOLD}Quick start:${RESET}"
 echo -e "  • ${CYAN}Super + S${RESET}  — highlight text anywhere, press to hear it"
-echo -e "  • ${CYAN}Super + A${RESET}  — open the GTK4 GUI app (voice/speed controls + preview)"
+echo -e "  • ${CYAN}Super + A${RESET}  — open the GTK4 GUI app (voice/speed controls + tray icon)"
 echo -e "  • ${CYAN}Super + P${RESET}  — pause or resume mid-playback"
 echo -e "  • Arabic and English segments are detected and spoken with separate voices"
 echo ""

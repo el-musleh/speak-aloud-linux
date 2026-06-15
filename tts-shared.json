@@ -1,0 +1,60 @@
+{
+  "voices": {
+    "english": [
+      {"id": "en-US-ChristopherNeural", "name": "Christopher (US)"},
+      {"id": "en-US-GuyNeural",         "name": "Guy (US)"},
+      {"id": "en-GB-RyanNeural",        "name": "Ryan (UK)"}
+    ],
+    "arabic": [
+      {"id": "ar-SA-HamedNeural",   "name": "Hamed (Saudi)"},
+      {"id": "ar-SA-ZariyahNeural", "name": "Zariyah (Saudi)"},
+      {"id": "ar-EG-SalmaNeural",   "name": "Salma (Egypt)"}
+    ],
+    "german": [
+      {"id": "de-DE-ConradNeural",  "name": "Conrad (DE)"},
+      {"id": "de-DE-KatjaNeural",   "name": "Katja (DE)"},
+      {"id": "de-DE-KillianNeural", "name": "Killian (DE)"}
+    ]
+  },
+  "source_languages": [
+    {"code": "auto", "name": "Auto-detect"},
+    {"code": "en",   "name": "English"},
+    {"code": "ar",   "name": "Arabic"},
+    {"code": "de",   "name": "German"}
+  ],
+  "translation_languages": [
+    {"code": "",   "name": "None"},
+    {"code": "en", "name": "English"},
+    {"code": "ar", "name": "Arabic"},
+    {"code": "de", "name": "German"},
+    {"code": "fr", "name": "French"},
+    {"code": "es", "name": "Spanish"},
+    {"code": "pt", "name": "Portuguese"},
+    {"code": "it", "name": "Italian"},
+    {"code": "nl", "name": "Dutch"},
+    {"code": "ru", "name": "Russian"},
+    {"code": "zh", "name": "Chinese"},
+    {"code": "ja", "name": "Japanese"},
+    {"code": "ko", "name": "Korean"},
+    {"code": "tr", "name": "Turkish"},
+    {"code": "pl", "name": "Polish"},
+    {"code": "hi", "name": "Hindi"}
+  ],
+  "translation_providers": [
+    {"code": "deepl",  "name": "DeepL"},
+    {"code": "google", "name": "Google Cloud"}
+  ],
+  "defaults": {
+    "voice": "en-US-ChristopherNeural",
+    "arabic_voice": "ar-SA-HamedNeural",
+    "german_voice": "de-DE-ConradNeural",
+    "rate": 50,
+    "arabic_rate": 30,
+    "german_rate": 30,
+    "source_language": "auto",
+    "translate_enabled": false,
+    "translate_provider": "deepl",
+    "translate_target": "",
+    "translate_api_key": ""
+  }
+}

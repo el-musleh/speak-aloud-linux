@@ -1,31 +1,71 @@
 #!/bin/bash
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_DIR="$HOME/.config/tts_settings"
 
+# ── Helper: read tts-shared.json via python3 ────────────────────────────────
+_json_get() {
+    python3 -c "
+import json
+d = json.load(open('$SCRIPT_DIR/tts-shared.json'))
+$1
+"
+}
+
+# Load defaults once
+DEFAULT_VOICE=$(_json_get "print(d['defaults']['voice'])")
+DEFAULT_AR_VOICE=$(_json_get "print(d['defaults']['arabic_voice'])")
+DEFAULT_DE_VOICE=$(_json_get "print(d['defaults']['german_voice'])")
+DEFAULT_RATE=$(_json_get "print(d['defaults']['rate'])")
+DEFAULT_AR_RATE=$(_json_get "print(d['defaults']['arabic_rate'])")
+DEFAULT_DE_RATE=$(_json_get "print(d['defaults']['german_rate'])")
+DEFAULT_SOURCE_LANG=$(_json_get "print(d['defaults']['source_language'])")
+DEFAULT_TRANSLATE_ENABLED=$(_json_get "print('yes' if d['defaults']['translate_enabled'] else 'no')")
+DEFAULT_TRANSLATE_PROVIDER=$(_json_get "print(d['defaults']['translate_provider'])")
+DEFAULT_TRANSLATE_TARGET=$(_json_get "print(d['defaults']['translate_target'])")
+
 # Load current settings with fallbacks
-CURRENT_VOICE=$(cat    "$CONFIG_DIR/voice"         2>/dev/null || echo "en-US-ChristopherNeural")
-CURRENT_AR_VOICE=$(cat "$CONFIG_DIR/arabic_voice"  2>/dev/null || echo "ar-SA-HamedNeural")
-CURRENT_DE_VOICE=$(cat "$CONFIG_DIR/german_voice" 2>/dev/null || echo "de-DE-ConradNeural")
+CURRENT_VOICE=$(cat    "$CONFIG_DIR/voice"         2>/dev/null || echo "$DEFAULT_VOICE")
+CURRENT_AR_VOICE=$(cat "$CONFIG_DIR/arabic_voice"  2>/dev/null || echo "$DEFAULT_AR_VOICE")
+CURRENT_DE_VOICE=$(cat "$CONFIG_DIR/german_voice"  2>/dev/null || echo "$DEFAULT_DE_VOICE")
 CURRENT_RATE=$(tr -d '+%' < "$CONFIG_DIR/rate" 2>/dev/null)
 CURRENT_AR_RATE=$(tr -d '+%' < "$CONFIG_DIR/arabic_rate" 2>/dev/null)
 CURRENT_DE_RATE=$(tr -d '+%' < "$CONFIG_DIR/german_rate" 2>/dev/null)
-CURRENT_SOURCE_LANG=$(cat "$CONFIG_DIR/source_language" 2>/dev/null || echo "auto")
-CURRENT_TRANSLATE_ENABLED=$(cat "$CONFIG_DIR/translate_enabled" 2>/dev/null || echo "no")
-CURRENT_TRANSLATE_PROVIDER=$(cat "$CONFIG_DIR/translate_provider" 2>/dev/null || echo "deepl")
-CURRENT_TRANSLATE_TARGET=$(cat "$CONFIG_DIR/translate_target" 2>/dev/null || echo "")
+CURRENT_SOURCE_LANG=$(cat "$CONFIG_DIR/source_language" 2>/dev/null || echo "$DEFAULT_SOURCE_LANG")
+CURRENT_TRANSLATE_ENABLED=$(cat "$CONFIG_DIR/translate_enabled" 2>/dev/null || echo "$DEFAULT_TRANSLATE_ENABLED")
+CURRENT_TRANSLATE_PROVIDER=$(cat "$CONFIG_DIR/translate_provider" 2>/dev/null || echo "$DEFAULT_TRANSLATE_PROVIDER")
+CURRENT_TRANSLATE_TARGET=$(cat "$CONFIG_DIR/translate_target" 2>/dev/null || echo "$DEFAULT_TRANSLATE_TARGET")
 CURRENT_TRANSLATE_KEY=$(cat "$CONFIG_DIR/translate_api_key" 2>/dev/null || echo "")
-[ -z "$CURRENT_RATE" ]        && CURRENT_RATE=50
-[ -z "$CURRENT_AR_RATE" ]     && CURRENT_AR_RATE=30
-[ -z "$CURRENT_DE_RATE" ]     && CURRENT_DE_RATE=30
+[ -z "$CURRENT_RATE" ]    && CURRENT_RATE=$DEFAULT_RATE
+[ -z "$CURRENT_AR_RATE" ] && CURRENT_AR_RATE=$DEFAULT_AR_RATE
+[ -z "$CURRENT_DE_RATE" ] && CURRENT_DE_RATE=$DEFAULT_DE_RATE
 
-# Build voice lists with current value first so it appears pre-selected
-EN_VOICES="$CURRENT_VOICE!en-US-ChristopherNeural!en-GB-RyanNeural!en-US-GuyNeural"
-AR_VOICES="$CURRENT_AR_VOICE!ar-SA-HamedNeural!ar-SA-ZariyahNeural!ar-EG-SalmaNeural"
-DE_VOICES="$CURRENT_DE_VOICE!de-DE-ConradNeural!de-DE-KatjaNeural!de-DE-KillianNeural"
+# Build lists from shared JSON (current value first for pre-selection)
+EN_VOICES=$(_json_get "
+voices = [v['id'] for v in d['voices']['english']]
+print('$CURRENT_VOICE' + '!' + '!'.join(voices))
+")
+AR_VOICES=$(_json_get "
+voices = [v['id'] for v in d['voices']['arabic']]
+print('$CURRENT_AR_VOICE' + '!' + '!'.join(voices))
+")
+DE_VOICES=$(_json_get "
+voices = [v['id'] for v in d['voices']['german']]
+print('$CURRENT_DE_VOICE' + '!' + '!'.join(voices))
+")
 
-SRC_LANGS="$CURRENT_SOURCE_LANG!auto!en!ar!de"
-TRANS_PROVIDERS="$CURRENT_TRANSLATE_PROVIDER!deepl!google"
-TRANS_TARGETS="$CURRENT_TRANSLATE_TARGET!!en!ar!de!fr!es!pt!it!nl!ru!zh!ja!ko!tr!pl!hi"
+SRC_LANGS=$(_json_get "
+codes = [l['code'] for l in d['source_languages']]
+print('$CURRENT_SOURCE_LANG' + '!' + '!'.join(codes))
+")
+TRANS_PROVIDERS=$(_json_get "
+codes = [p['code'] for p in d['translation_providers']]
+print('$CURRENT_TRANSLATE_PROVIDER' + '!' + '!'.join(codes))
+")
+TRANS_TARGETS=$(_json_get "
+codes = [l['code'] for l in d['translation_languages']]
+print('$CURRENT_TRANSLATE_TARGET' + '!' + '!'.join(codes))
+")
 
 CACHE_DIR="$HOME/.cache/speak-aloud"
 
@@ -66,9 +106,9 @@ if [ $EXIT_CODE -eq 0 ]; then
     EN_RATE=$(echo "$EN_RATE" | grep -o '[0-9]\+' | head -1)
     AR_RATE=$(echo "$AR_RATE" | grep -o '[0-9]\+' | head -1)
     DE_RATE=$(echo "$DE_RATE" | grep -o '[0-9]\+' | head -1)
-    EN_RATE=${EN_RATE:-50}
-    AR_RATE=${AR_RATE:-30}
-    DE_RATE=${DE_RATE:-30}
+    EN_RATE=${EN_RATE:-$DEFAULT_RATE}
+    AR_RATE=${AR_RATE:-$DEFAULT_AR_RATE}
+    DE_RATE=${DE_RATE:-$DEFAULT_DE_RATE}
 
     # Validate voice IDs (alphanumeric with hyphens); fallback per language
     validate_voice() {
@@ -79,11 +119,11 @@ if [ $EXIT_CODE -eq 0 ]; then
             echo "$fallback"
         fi
     }
-    
-    EN_VOICE=$(validate_voice "$EN_VOICE" "en-US-ChristopherNeural")
-    AR_VOICE=$(validate_voice "$AR_VOICE" "ar-SA-HamedNeural")
-    DE_VOICE=$(validate_voice "$DE_VOICE" "de-DE-ConradNeural")
-    
+
+    EN_VOICE=$(validate_voice "$EN_VOICE" "$DEFAULT_VOICE")
+    AR_VOICE=$(validate_voice "$AR_VOICE" "$DEFAULT_AR_VOICE")
+    DE_VOICE=$(validate_voice "$DE_VOICE" "$DEFAULT_DE_VOICE")
+
     # Custom voice ID overrides the English voice dropdown if filled in
     if [ -n "$CUSTOM_VOICE" ]; then
         EN_VOICE=$(validate_voice "$CUSTOM_VOICE" "$EN_VOICE")

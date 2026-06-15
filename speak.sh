@@ -8,6 +8,7 @@ CONFIG_DIR="$HOME/.config/tts_settings"
 # Use system temp directory for portability
 TEMP_DIR="${TMPDIR:-/tmp}"
 WORK_DIR="$TEMP_DIR/speak-aloud-work"
+TTS_STATUS_FILE="$TEMP_DIR/tts-status"   # polled by tts-daemon.py tray icon
 
 # ── Parse optional CLI args ───────────────────────────────────────────────────
 OVERRIDE_TEXT=""
@@ -233,7 +234,7 @@ generate_audio() {
     tmp_stderr=$(create_temp_file)
     tmp_audio=$(create_temp_file ".mp3")
 
-    for attempt in 1 2 3; do
+    for attempt in 1 2 3 4 5; do
         : > "$tmp_stderr"
         if edge-tts --voice "$voice" "${rate_args[@]}" --text "$text" --write-media "$tmp_audio" 2>"$tmp_stderr"; then
             # Validate the generated audio file
@@ -254,17 +255,21 @@ generate_audio() {
         if grep -q "NoAudioReceived" "$tmp_stderr"; then
             err_msg="Text contains no speakable content (e.g., only punctuation)."
         elif grep -q -i "timeout\|connection\|websocket" "$tmp_stderr"; then
-            if [ "$attempt" -lt 3 ]; then
-                delay=$(( attempt * 2 ))
-                notify-send "TTS Retry" "Connection issue — retrying in ${delay}s (attempt $attempt/3)"
+            if [ "$attempt" -lt 5 ]; then
+                delay=$(( 2 ** attempt ))
+                echo "STATUS:RETRYING"
+                echo "RETRYING" > "$TTS_STATUS_FILE"
+                notify-send "TTS Retry" "Connection issue — retrying in ${delay}s (attempt $attempt/5)"
                 sleep "$delay"
                 continue
             fi
-            err_msg="Connection timed out after 3 attempts. Check your internet."
+            err_msg="Connection timed out after 5 attempts. Check your internet."
         elif grep -q -i "rate.*limit\|429\|too many" "$tmp_stderr"; then
-            if [ "$attempt" -lt 3 ]; then
-                delay=$(( attempt * 3 ))
-                notify-send "TTS Retry" "Rate limited — waiting ${delay}s (attempt $attempt/3)"
+            if [ "$attempt" -lt 5 ]; then
+                delay=$(( 3 * attempt ))
+                echo "STATUS:RETRYING"
+                echo "RETRYING" > "$TTS_STATUS_FILE"
+                notify-send "TTS Retry" "Rate limited — waiting ${delay}s (attempt $attempt/5)"
                 sleep "$delay"
                 continue
             fi
@@ -636,6 +641,7 @@ fi
 if [ -n "$OVERRIDE_TEXT" ]; then
 
     echo "STATUS:GENERATING"
+    echo "GENERATING" > "$TTS_STATUS_FILE"
 
     # Launch all edge-tts jobs in parallel
     PIDS=""
@@ -687,6 +693,7 @@ if [ -n "$OVERRIDE_TEXT" ]; then
     fi
 
     echo "STATUS:PLAYING"
+    echo "PLAYING" > "$TTS_STATUS_FILE"
 
     INITIAL_SPEED="${OVERRIDE_SPEED:-1.5}"
     rm -f "$MPV_SOCKET"
@@ -756,6 +763,7 @@ if [ -n "$OVERRIDE_TEXT" ]; then
     # "quit" over the socket, which makes this wait return.
     wait "$MPV_PID"
     rm -f "$MPV_SOCKET"
+    echo "IDLE" > "$TTS_STATUS_FILE"
 
     # Export to file if --output was requested
     if [ -n "$OUTPUT_FILE" ]; then
@@ -780,6 +788,8 @@ if [ -n "$OVERRIDE_TEXT" ]; then
 # then append remaining segments via IPC while generation continues.
 # ═════════════════════════════════════════════════════════════════════════════
 else
+
+    echo "GENERATING" > "$TTS_STATUS_FILE"
 
     # Generate all audio files in parallel
     PIDS=""
@@ -829,6 +839,7 @@ else
         exit 0
     fi
 
+    echo "PLAYING" > "$TTS_STATUS_FILE"
     rm -f "$MPV_SOCKET"
     mpv "$FIRST_FILE" --no-terminal --input-ipc-server="$MPV_SOCKET" 200>&- &
     MPV_PID=$!
@@ -900,5 +911,6 @@ else
     # "quit" over the socket, which makes this wait return.
     wait "$MPV_PID"
     rm -f "$MPV_SOCKET"
+    echo "IDLE" > "$TTS_STATUS_FILE"
 
 fi

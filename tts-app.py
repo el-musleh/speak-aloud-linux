@@ -12,6 +12,7 @@ import shutil
 import signal
 import socket as _sock
 import subprocess
+import sys
 import glob
 import tempfile
 import threading
@@ -19,12 +20,17 @@ import time
 from enum import Enum, auto
 from threading import Lock, Event
 
-try:
-    import pystray
-    from PIL import Image, ImageDraw
-    _HAS_TRAY = True
-except Exception:
-    _HAS_TRAY = False
+def _notify(title: str, body: str = '', icon: str = 'audio-speakers') -> None:
+    """Fire-and-forget desktop notification."""
+    def _do():
+        try:
+            subprocess.run(
+                ['notify-send', '-i', icon, '-h', 'int:transient:1',
+                 '-t', '4000', title, body],
+                capture_output=True, timeout=5)
+        except Exception:
+            pass
+    threading.Thread(target=_do, daemon=True).start()
 
 SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(SCRIPT_DIR, 'config.json')   # voice catalog only (read-only)
@@ -32,6 +38,15 @@ SPEAK_SH    = os.path.join(SCRIPT_DIR, 'speak.sh')
 
 # Single source of truth for user settings — shared with speak.sh / tts-settings.sh
 SHELL_CFG_DIR = os.path.expanduser('~/.config/tts_settings')
+
+# Shared catalog + defaults (single source of truth with tts-settings.sh)
+_SHARED_PATH = os.path.join(SCRIPT_DIR, 'tts-shared.json')
+try:
+    with open(_SHARED_PATH) as _f:
+        _SHARED = json.load(_f)
+except (FileNotFoundError, json.JSONDecodeError, OSError) as _e:
+    print(f'Warning: could not load {_SHARED_PATH}: {_e}')
+    _SHARED = {}
 
 
 def read_setting(name: str, default: str) -> str:
@@ -59,37 +74,16 @@ def read_bool_setting(name: str, default: bool = False) -> bool:
     return raw in ('yes', 'true', '1', 'on')
 
 
-# ── Language data ────────────────────────────────────────────────────────────
+# ── Language data (loaded from tts-shared.json) ─────────────────────────────
 
 SOURCE_LANGUAGES = [
-    ('auto', 'Auto-detect'),
-    ('en',   'English'),
-    ('ar',   'Arabic'),
-    ('de',   'German'),
+    (item['code'], item['name']) for item in _SHARED.get('source_languages', [])
 ]
-
 TRANSLATION_LANGUAGES = [
-    ('',    'None'),
-    ('en',  'English'),
-    ('ar',  'Arabic'),
-    ('de',  'German'),
-    ('fr',  'French'),
-    ('es',  'Spanish'),
-    ('pt',  'Portuguese'),
-    ('it',  'Italian'),
-    ('nl',  'Dutch'),
-    ('ru',  'Russian'),
-    ('zh',  'Chinese'),
-    ('ja',  'Japanese'),
-    ('ko',  'Korean'),
-    ('tr',  'Turkish'),
-    ('pl',  'Polish'),
-    ('hi',  'Hindi'),
+    (item['code'], item['name']) for item in _SHARED.get('translation_languages', [])
 ]
-
 TRANSLATION_PROVIDERS = [
-    ('deepl',  'DeepL'),
-    ('google', 'Google Cloud'),
+    (item['code'], item['name']) for item in _SHARED.get('translation_providers', [])
 ]
 
 # Use system temp directory for portability
@@ -99,30 +93,13 @@ WORK_DIR    = os.path.join(TEMP_DIR, 'speak-aloud-work')
 SAVED_DIR   = os.path.join(TEMP_DIR, 'speak-aloud-saved')  # snapshot for "Save Audio"
 MAX_CHARS   = 5000
 
-DEFAULT_CONFIG = {
-    'voices': {
-        'english': [
-            {'id': 'en-US-ChristopherNeural', 'name': 'Christopher (US)'},
-            {'id': 'en-US-GuyNeural',         'name': 'Guy (US)'},
-            {'id': 'en-GB-RyanNeural',        'name': 'Ryan (UK)'},
-        ],
-        'arabic': [
-            {'id': 'ar-SA-HamedNeural',   'name': 'Hamed (Saudi)'},
-            {'id': 'ar-SA-ZariyahNeural', 'name': 'Zariyah (Saudi)'},
-            {'id': 'ar-EG-SalmaNeural',   'name': 'Salma (Egypt)'},
-        ],
-        'german': [
-            {'id': 'de-DE-ConradNeural',  'name': 'Conrad (DE)'},
-            {'id': 'de-DE-KatjaNeural',   'name': 'Katja (DE)'},
-            {'id': 'de-DE-KillianNeural', 'name': 'Killian (DE)'},
-        ],
-    },
-}
+DEFAULT_CONFIG = {'voices': _SHARED.get('voices', {})}
 
 
 class AppState(Enum):
     IDLE       = auto()
     GENERATING = auto()
+    RETRYING   = auto()
     PLAYING    = auto()
 
 
@@ -307,6 +284,8 @@ class TTSManager:
             return GLib.SOURCE_REMOVE   # stale — from a replaced or killed process
         if line == 'STATUS:GENERATING':
             self._on_state(AppState.GENERATING)
+        elif line == 'STATUS:RETRYING':
+            self._on_state(AppState.RETRYING)
         elif line == 'STATUS:PLAYING':
             self._on_state(AppState.PLAYING)
         elif line == 'STATUS:ERROR':
@@ -393,6 +372,7 @@ class TTSWindow(Adw.ApplicationWindow):
     _STATE_UI = {
         AppState.IDLE:       ('▶  Speak', 'suggested-action',  False, '○', 'Ready — highlight text and press Speak'),
         AppState.GENERATING: ('■  Stop',  'destructive-action', False, '⟳', 'Generating audio…'),
+        AppState.RETRYING:   ('■  Stop',  'destructive-action', False, '⟳', 'Network issue — retrying…'),
         AppState.PLAYING:    ('■  Stop',  'destructive-action', True,  '♪', 'Playing…'),
     }
 
@@ -416,18 +396,11 @@ class TTSWindow(Adw.ApplicationWindow):
             on_state_change=self._set_state,
             on_error=self._show_error,
         )
-        self._tray_shutdown = Event()  # Coordinate tray shutdown
-
         self._build_ui()
         self._load_saved_settings()
         self.connect('close-request', self._on_close_request)
         self.connect('realize', self._resize_to_content)
         GLib.idle_add(self._check_wayland_clipboard)
-
-        # Start system-tray icon in background thread
-        self._tray_icon = None
-        self._tray_thread = threading.Thread(target=self._run_tray, daemon=True)
-        self._tray_thread.start()
 
     # ── UI construction ───────────────────────────────────────────────────────
 
@@ -509,9 +482,10 @@ class TTSWindow(Adw.ApplicationWindow):
             title='Playback Speed',
             description='Drag during playback for instant real-time adjustment')
 
-        self._en_speed_lbl, en_row = self._make_speed_row('English', 50)
-        self._ar_speed_lbl, ar_row = self._make_speed_row('Arabic',  30)
-        self._de_speed_lbl, de_row = self._make_speed_row('German',  30)
+        _d = _SHARED.get('defaults', {})
+        self._en_speed_lbl, en_row = self._make_speed_row('English', _d.get('rate', 50))
+        self._ar_speed_lbl, ar_row = self._make_speed_row('Arabic',  _d.get('arabic_rate', 30))
+        self._de_speed_lbl, de_row = self._make_speed_row('German',  _d.get('german_rate', 30))
         speed_group.add(en_row)
         speed_group.add(ar_row)
         speed_group.add(de_row)
@@ -660,16 +634,17 @@ class TTSWindow(Adw.ApplicationWindow):
         en_voices = self.config['voices']['english']
         ar_voices = self.config['voices']['arabic']
         de_voices = self.config['voices']['german']
+        _d = _SHARED.get('defaults', {})
         self._en_combo.set_selected(
-            voice_index(en_voices, read_setting('voice', 'en-US-ChristopherNeural')))
+            voice_index(en_voices, read_setting('voice', _d.get('voice', 'en-US-ChristopherNeural'))))
         self._ar_combo.set_selected(
-            voice_index(ar_voices, read_setting('arabic_voice', 'ar-SA-HamedNeural')))
+            voice_index(ar_voices, read_setting('arabic_voice', _d.get('arabic_voice', 'ar-SA-HamedNeural'))))
         self._de_combo.set_selected(
-            voice_index(de_voices, read_setting('german_voice', 'de-DE-ConradNeural')))
+            voice_index(de_voices, read_setting('german_voice', _d.get('german_voice', 'de-DE-ConradNeural'))))
 
-        en_spd = read_rate('rate', 50)
-        ar_spd = read_rate('arabic_rate', 30)
-        de_spd = read_rate('german_rate', 30)
+        en_spd = read_rate('rate', _d.get('rate', 50))
+        ar_spd = read_rate('arabic_rate', _d.get('arabic_rate', 30))
+        de_spd = read_rate('german_rate', _d.get('german_rate', 30))
         self._en_scale.set_value(en_spd)
         self._ar_scale.set_value(ar_spd)
         self._de_scale.set_value(de_spd)
@@ -678,24 +653,24 @@ class TTSWindow(Adw.ApplicationWindow):
         self._de_speed_lbl.set_label(f'+{de_spd}%  ({(100+de_spd)/100:.1f}×)')
 
         # Source language
-        saved_src = read_setting('source_language', 'auto')
+        saved_src = read_setting('source_language', _d.get('source_language', 'auto'))
         src_idx = next((i for i, (code, _) in enumerate(SOURCE_LANGUAGES) if code == saved_src), 0)
         self._source_lang_combo.set_selected(src_idx)
 
         # Translation
-        trans_enabled = read_bool_setting('translate_enabled', False)
+        trans_enabled = read_bool_setting('translate_enabled', _d.get('translate_enabled', False))
         self._trans_enabled.set_active(trans_enabled)
         self._on_trans_enabled_changed(self._trans_enabled, trans_enabled)
 
-        prov_saved = read_setting('translate_provider', 'deepl')
+        prov_saved = read_setting('translate_provider', _d.get('translate_provider', 'deepl'))
         prov_idx = next((i for i, (code, _) in enumerate(TRANSLATION_PROVIDERS) if code == prov_saved), 0)
         self._trans_provider_combo.set_selected(prov_idx)
 
-        tgt_saved = read_setting('translate_target', '')
+        tgt_saved = read_setting('translate_target', _d.get('translate_target', ''))
         tgt_idx = next((i for i, (code, _) in enumerate(TRANSLATION_LANGUAGES) if code == tgt_saved), 0)
         self._trans_target_combo.set_selected(tgt_idx)
 
-        self._trans_api_entry.set_text(read_setting('translate_api_key', ''))
+        self._trans_api_entry.set_text(read_setting('translate_api_key', _d.get('translate_api_key', '')))
 
     # ── State machine ─────────────────────────────────────────────────────────
 
@@ -718,13 +693,23 @@ class TTSWindow(Adw.ApplicationWindow):
             # Only show save button if we actually have audio
             self._save_btn.set_visible(self._has_audio)
         elif state == AppState.GENERATING:
-            self._has_audio = False  # Reset audio flag when starting new generation
+            self._has_audio = False
             self._save_btn.set_visible(False)
+            _notify('TTS: Generating audio…',
+                    'Converting text to speech…',
+                    'audio-speakers')
+        elif state == AppState.RETRYING:
+            self._has_audio = False
+            self._save_btn.set_visible(False)
+            _notify('TTS: Retrying network…',
+                    'Connection issue — trying again…',
+                    'network-error')
         elif state == AppState.PLAYING:
-            self._has_audio = True  # We have audio when playing starts
-            # Snapshot the segments now — speak.sh wipes WORK_DIR on its next
-            # run, so "Save Audio" must not depend on it surviving.
+            self._has_audio = True
             self._snapshot_segments()
+            _notify('TTS: Playing',
+                    'Audio is now playing',
+                    'audio-speakers')
 
     # ── Signal handlers ───────────────────────────────────────────────────────
 
@@ -854,12 +839,23 @@ class TTSWindow(Adw.ApplicationWindow):
         return GLib.SOURCE_REMOVE
 
     def _save_settings(self, en_idx: int, ar_idx: int, de_idx: int,
-                       src_lang: str = 'auto',
-                       trans_enabled: str = 'no',
-                       trans_provider: str = 'deepl',
-                       trans_target: str = '',
-                       trans_key: str = ''):
+                       src_lang: str = None,
+                       trans_enabled: str = None,
+                       trans_provider: str = None,
+                       trans_target: str = None,
+                       trans_key: str = None):
         """Persist all selections to ~/.config/tts_settings (single source of truth)."""
+        _d = _SHARED.get('defaults', {})
+        if src_lang is None:
+            src_lang = _d.get('source_language', 'auto')
+        if trans_enabled is None:
+            trans_enabled = 'yes' if _d.get('translate_enabled', False) else 'no'
+        if trans_provider is None:
+            trans_provider = _d.get('translate_provider', 'deepl')
+        if trans_target is None:
+            trans_target = _d.get('translate_target', '')
+        if trans_key is None:
+            trans_key = _d.get('translate_api_key', '')
         en_rate = int(self._en_scale.get_value())
         ar_rate = int(self._ar_scale.get_value())
         de_rate = int(self._de_scale.get_value())
@@ -992,6 +988,21 @@ class TTSWindow(Adw.ApplicationWindow):
         dialog = Adw.MessageDialog(
             transient_for=self, heading='TTS Error', body=message)
         dialog.add_response('ok', 'OK')
+        dialog.add_response('retry', 'Retry')
+        dialog.set_response_appearance('retry', Adw.ResponseAppearance.SUGGESTED)
+
+        def on_response(dialog, response):
+            if response == 'retry':
+                text = self._tbuf.get_text(
+                    self._tbuf.get_start_iter(),
+                    self._tbuf.get_end_iter(), False,
+                )
+                # Only retry if there's actual text (not the placeholder)
+                if text and not text.startswith('(Nothing selected'):
+                    self._on_text_ready_for_speaking(text)
+            dialog.destroy()
+
+        dialog.connect('response', on_response)
         dialog.present()
 
     def _show_char_limit_warning(self, char_count: int) -> None:
@@ -1005,96 +1016,13 @@ class TTSWindow(Adw.ApplicationWindow):
         dialog.add_response('ok', 'OK')
         dialog.present()
 
-    # ── Tray icon ─────────────────────────────────────────────────────────────
-
-    def _run_tray(self):
-        if not _HAS_TRAY:
-            return
-        try:
-            icon = pystray.Icon(
-                'speak-aloud',
-                icon=self._create_tray_image(),
-                title='Speak a Loud',
-                menu=self._build_tray_menu(),
-            )
-            self._tray_icon = icon
-            icon.run()
-        except Exception:
-            pass
-
-    @staticmethod
-    def _create_tray_image():
-        # Simple microphone-style icon: blue circle on white
-        width, height = 64, 64
-        image = Image.new('RGBA', (width, height), (255, 255, 255, 0))
-        dc = ImageDraw.Draw(image)
-        dc.ellipse([4, 4, width - 4, height - 4], fill=(66, 133, 244, 255))
-        dc.ellipse([20, 20, width - 20, height - 20], fill=(255, 255, 255, 255))
-        dc.ellipse([24, 24, width - 24, height - 24], fill=(66, 133, 244, 255))
-        return image
-
-    def _build_tray_menu(self):
-        def on_toggle(icon, _item):
-            if not self._tray_shutdown.is_set():
-                GLib.idle_add(self._manager.send_mpv, ['cycle', 'pause'])
-
-        def on_stop(icon, _item):
-            if not self._tray_shutdown.is_set():
-                GLib.idle_add(self._manager.kill)
-
-        def on_show(icon, _item):
-            if not self._tray_shutdown.is_set():
-                GLib.idle_add(self.present)
-
-        def on_quit(icon, _item):
-            self._tray_shutdown.set()
-            icon.stop()
-            GLib.idle_add(self._quit_app)
-
-        def on_seek(offset):
-            def _fn(icon, _item):
-                if not self._tray_shutdown.is_set():
-                    state = self._manager.get_mpv_state()
-                    if state:
-                        new_pos = max(0, state['position'] + offset)
-                        self._manager.send_mpv(['set_property', 'time-pos', new_pos])
-            return _fn
-
-        return pystray.Menu(
-            pystray.MenuItem('Show TTS App', on_show),
-            pystray.Menu.SEPARATOR,
-            pystray.MenuItem(lambda item: self._tray_play_text(), on_toggle),
-            pystray.MenuItem('⏹  Stop', on_stop),
-            pystray.Menu.SEPARATOR,
-            pystray.MenuItem('⏪  -10s', on_seek(-10)),
-            pystray.MenuItem('⏩  +10s', on_seek(10)),
-            pystray.Menu.SEPARATOR,
-            pystray.MenuItem('Quit', on_quit),
-        )
-
-    def _tray_play_text(self) -> str:
-        state = self._manager.get_mpv_state()
-        if not state:
-            return '▶  Play'
-        return '⏸  Pause' if not state.get('paused') else '▶  Play'
-
     def _quit_app(self):
-        self._tray_shutdown.set()  # Signal tray thread to stop
         self._manager.shutdown()
-        if self._tray_icon:
-            self._tray_icon.stop()
-        # Give tray thread a moment to clean up
-        if self._tray_thread.is_alive():
-            self._tray_thread.join(timeout=1.0)
         self.get_application().quit()
 
     # ── Override close to hide to tray ────────────────────────────────────────
 
     def _on_close_request(self, _win) -> bool:
-        if _HAS_TRAY:
-            # Hide to tray — keep playback and the manager alive
-            self.set_visible(False)
-            return True   # do NOT destroy window, just hide
         self._manager.shutdown()
         return False
 
@@ -1111,5 +1039,4 @@ class TTSApp(Adw.Application):
 
 
 if __name__ == '__main__':
-    import sys
     TTSApp().run(sys.argv)
