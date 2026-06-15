@@ -193,7 +193,7 @@ CACHE_DIR="$HOME/.cache/speak-aloud"
 mkdir -p "$CACHE_DIR"
 
 # Prune cache entries not used in the last 30 days (keeps cache bounded)
-find "$CACHE_DIR" -name '*.mp3' -type f -atime +30 -delete 2>/dev/null &
+find "$CACHE_DIR" -name '*.mp3' -type f -atime +30 -delete 2>/dev/null 200>&- &
 
 cache_key() {
     # Hash the full raw inputs — no sanitizing/truncation, so distinct
@@ -552,9 +552,9 @@ split_long_segments() {
         text=$(cat "$tmp_txt")
         lang=$(cat "$tmp_lang" 2>/dev/null || echo en)
         if [ ${#text} -le "$max" ]; then
-            # Short segment: write directly to final location
-            printf '%s' "$text" > "$WORK_DIR/seg_$(printf "%03d" "$idx_counter").txt"
-            printf '%s' "$lang" > "$WORK_DIR/seg_$(printf "%03d" "$idx_counter").lang"
+            # Short segment: write to split_out so all segments share one pool
+            printf '%s' "$text" > "$split_out/chunk_$(printf "%03d" "$idx_counter").txt"
+            printf '%s' "$lang" > "$split_out/chunk_$(printf "%03d" "$idx_counter").lang"
             idx_counter=$((idx_counter + 1))
         else
             # Long segment: split to temporary split_out dir with unique indices
@@ -595,6 +595,11 @@ print(idx)
 PYEOF
             idx_counter=$(python3 "$py_script" "${text}" "$max" "$lang" "$split_out" "$idx_counter")
             rm -f "$py_script" "$tmp_txt" "$tmp_lang"
+            if [ -z "$idx_counter" ]; then
+                rm -rf "$staging" "$split_out"
+                echo "0"
+                return 1
+            fi
         fi
     done
     # Move split chunks from split_out to final location with proper sequential indices
@@ -607,20 +612,6 @@ PYEOF
         mv "$split_out/chunk_${chunk_idx}.lang" "$WORK_DIR/seg_$(printf "%03d" "$final_idx").lang"
         final_idx=$((final_idx + 1))
     done < <(find "$split_out" -maxdepth 1 -name 'chunk_*.txt' -print0 2>/dev/null | sort -z)
-    # Also include any short segments already in work dir (re-index them)
-    while IFS= read -r -d '' f; do
-        local existing_idx dest_txt dest_lang
-        existing_idx=$(basename "$f" .txt | sed 's/seg_//')
-        if [ "$((10#$existing_idx))" -ge "$final_idx" ] 2>/dev/null; then
-            dest_txt="$WORK_DIR/seg_$(printf "%03d" "$final_idx").txt"
-            dest_lang="$WORK_DIR/seg_$(printf "%03d" "$final_idx").lang"
-            if [ "$f" != "$dest_txt" ]; then
-                mv "$f" "$dest_txt"
-                mv "$WORK_DIR/seg_${existing_idx}.lang" "$dest_lang" 2>/dev/null || true
-            fi
-            final_idx=$((final_idx + 1))
-        fi
-    done < <(find "$WORK_DIR" -maxdepth 1 -name 'seg_*.txt' -print0 2>/dev/null | sort -z)
     rm -rf "$staging" "$split_out"
     echo "$final_idx"
 }
@@ -668,7 +659,7 @@ if [ -n "$OVERRIDE_TEXT" ]; then
                 fi
                 cache_store "$AUDIO" "$CACHED"
             fi
-        ) &
+        ) 200>&- &
         PIDS="$PIDS $!"
     done
 
@@ -699,7 +690,7 @@ if [ -n "$OVERRIDE_TEXT" ]; then
 
     INITIAL_SPEED="${OVERRIDE_SPEED:-1.5}"
     rm -f "$MPV_SOCKET"
-    mpv "$FIRST_FILE" --no-terminal --input-ipc-server="$MPV_SOCKET" &
+    mpv "$FIRST_FILE" --no-terminal --input-ipc-server="$MPV_SOCKET" 200>&- &
     MPV_PID=$!
 
     # Wait for socket, then set initial playback speed
@@ -707,13 +698,14 @@ if [ -n "$OVERRIDE_TEXT" ]; then
         sleep 0.1
         if [ -S "$MPV_SOCKET" ]; then
             printf '{"command":["set_property","speed",%s]}\n' "$INITIAL_SPEED" \
-                | socat - "$MPV_SOCKET" 2>/dev/null
+                | socat - "$MPV_SOCKET" 2>/dev/null 200>&-
             break
         fi
     done
 
     # ── Background: append remaining segments in order via IPC ──────────────
     (
+        exec 200>&-
         CURRENT_IDX=0
         while true; do
             NEXT_IDX=$((CURRENT_IDX + 1))
@@ -722,7 +714,7 @@ if [ -n "$OVERRIDE_TEXT" ]; then
             if [ -f "$NEXT_FILE" ] && [ -s "$NEXT_FILE" ]; then
                 if [ -S "$MPV_SOCKET" ]; then
                     printf '{"command":["loadfile","%s","append"]}\n' "$NEXT_FILE" \
-                        | socat - "$MPV_SOCKET" 2>/dev/null
+                        | socat - "$MPV_SOCKET" 2>/dev/null 200>&-
                 fi
                 CURRENT_IDX=$NEXT_IDX
             fi
@@ -730,7 +722,7 @@ if [ -n "$OVERRIDE_TEXT" ]; then
             # Check if all generation jobs are done
             ALL_DONE=1
             for pid in $PIDS; do
-                if kill -0 "$pid" 2>/dev/null; then
+                if [ -f "/proc/$pid/status" ] && ! grep -q "^State:.*Z (zombie)" "/proc/$pid/status" && kill -0 "$pid" 2>/dev/null; then
                     ALL_DONE=0
                     break
                 fi
@@ -811,7 +803,7 @@ else
                 fi
                 cache_store "$AUDIO" "$CACHED"
             fi
-        ) &
+        ) 200>&- &
         PIDS="$PIDS $!"
     done
 
@@ -838,11 +830,12 @@ else
     fi
 
     rm -f "$MPV_SOCKET"
-    mpv "$FIRST_FILE" --no-terminal --input-ipc-server="$MPV_SOCKET" &
+    mpv "$FIRST_FILE" --no-terminal --input-ipc-server="$MPV_SOCKET" 200>&- &
     MPV_PID=$!
 
     # ── Background: append remaining segments in order via IPC ──────────────
     (
+        exec 200>&-
         CURRENT_IDX=0
         while true; do
             NEXT_IDX=$((CURRENT_IDX + 1))
@@ -851,14 +844,14 @@ else
             if [ -f "$NEXT_FILE" ] && [ -s "$NEXT_FILE" ]; then
                 if [ -S "$MPV_SOCKET" ]; then
                     printf '{"command":["loadfile","%s","append"]}\n' "$NEXT_FILE" \
-                        | socat - "$MPV_SOCKET" 2>/dev/null
+                        | socat - "$MPV_SOCKET" 2>/dev/null 200>&-
                 fi
                 CURRENT_IDX=$NEXT_IDX
             fi
 
             ALL_DONE=1
             for pid in $PIDS; do
-                if kill -0 "$pid" 2>/dev/null; then
+                if [ -f "/proc/$pid/status" ] && ! grep -q "^State:.*Z (zombie)" "/proc/$pid/status" && kill -0 "$pid" 2>/dev/null; then
                     ALL_DONE=0
                     break
                 fi
