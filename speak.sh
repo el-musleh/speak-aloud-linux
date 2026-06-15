@@ -242,7 +242,10 @@ generate_audio() {
                 rm -f "$tmp_stderr" "$tmp_audio"
                 return 0
             else
-                echo "Generated file is not valid audio" >&2
+                # Debug: log why validation failed
+                echo "Generated file is not valid audio (size: $(stat -c%s "$tmp_audio" 2>/dev/null || echo 0) bytes, type: $(file "$tmp_audio" 2>/dev/null))" >&2
+                echo "edge-tts stderr: $(cat "$tmp_stderr")" >&2
+                echo "Text was: '${text:0:100}...' (len=${#text})" >&2
             fi
         fi
 
@@ -525,25 +528,41 @@ fi  # end of source-language override / auto-detection block
 # sentence-sized chunks so progressive playback can start sooner.
 MAX_SEGMENT_CHARS=600
 split_long_segments() {
-    local max=$1 old_count=$2 new_idx=0
-    local i tmp_txt tmp_lang text lang
+    local max=$1 old_count=$2
+    local staging split_out
+    staging="$WORK_DIR/.staging"
+    split_out="$WORK_DIR/.split_out"
+    mkdir -p "$staging" "$split_out"
+    # Move all original segments to staging first
+    local i
     for i in $(seq 0 $((old_count - 1))); do
-        tmp_txt="$WORK_DIR/seg_$(printf "%03d" "$i").txt"
-        tmp_lang="$WORK_DIR/seg_$(printf "%03d" "$i").lang"
+        local src_txt src_lang
+        src_txt="$WORK_DIR/seg_$(printf "%03d" "$i").txt"
+        src_lang="$WORK_DIR/seg_$(printf "%03d" "$i").lang"
+        [ -f "$src_txt" ] && mv "$src_txt" "$staging/seg_$(printf "%03d" "$i").txt"
+        [ -f "$src_lang" ] && mv "$src_lang" "$staging/seg_$(printf "%03d" "$i").lang"
+    done
+    # Process from staging, write short ones directly, long ones to split_out
+    local idx_counter=0
+    for i in $(seq 0 $((old_count - 1))); do
+        local tmp_txt tmp_lang text lang
+        tmp_txt="$staging/seg_$(printf "%03d" "$i").txt"
+        tmp_lang="$staging/seg_$(printf "%03d" "$i").lang"
         [ -f "$tmp_txt" ] || continue
         text=$(cat "$tmp_txt")
         lang=$(cat "$tmp_lang" 2>/dev/null || echo en)
         if [ ${#text} -le "$max" ]; then
-            mv "$tmp_txt" "$WORK_DIR/seg_$(printf "%03d" "$new_idx").txt"
-            printf '%s' "$lang" > "$WORK_DIR/seg_$(printf "%03d" "$new_idx").lang"
-            new_idx=$((new_idx + 1))
-            continue
-        fi
-        # Split at sentence boundaries using Python
-        py_script=$(mktemp)
-        cat > "$py_script" <<'PYEOF'
+            # Short segment: write directly to final location
+            printf '%s' "$text" > "$WORK_DIR/seg_$(printf "%03d" "$idx_counter").txt"
+            printf '%s' "$lang" > "$WORK_DIR/seg_$(printf "%03d" "$idx_counter").lang"
+            idx_counter=$((idx_counter + 1))
+        else
+            # Long segment: split to temporary split_out dir with unique indices
+            local py_script
+            py_script=$(mktemp)
+            cat > "$py_script" <<'PYEOF'
 import sys, re, os
-text, max_len, lang, workdir, start_idx = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4], int(sys.argv[5])
+text, max_len, lang, outdir, start_counter = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4], int(sys.argv[5])
 abbrev = r'\b(?:Dr|Mr|Mrs|Ms|Prof|Jr|Sr|vs|etc|e\.g|i\.e|Inc|Ltd|Corp|No|no|fig|Fig|vol|pg|p)\.'
 text = re.sub(abbrev, lambda m: m.group().replace('.', '\x00'), text)
 parts = re.split(r'(?<=[.!?])\s+(?=[A-Z"\'\u0600-\u06FF])', text)
@@ -565,19 +584,45 @@ for p in result:
         current = p
 if current:
     chunks.append(current)
-idx = start_idx
+idx = start_counter
 for ch in chunks:
-    with open(os.path.join(workdir, f'seg_{idx:03d}.txt'), 'w') as f:
+    with open(os.path.join(outdir, f'chunk_{idx:03d}.txt'), 'w') as f:
         f.write(ch)
-    with open(os.path.join(workdir, f'seg_{idx:03d}.lang'), 'w') as f:
+    with open(os.path.join(outdir, f'chunk_{idx:03d}.lang'), 'w') as f:
         f.write(lang)
     idx += 1
 print(idx)
 PYEOF
-        new_idx=$(python3 "$py_script" "${text}" "$max" "$lang" "$WORK_DIR" "$new_idx")
-        rm -f "$py_script" "$tmp_txt" "$tmp_lang"
+            idx_counter=$(python3 "$py_script" "${text}" "$max" "$lang" "$split_out" "$idx_counter")
+            rm -f "$py_script" "$tmp_txt" "$tmp_lang"
+        fi
     done
-    echo "$new_idx"
+    # Move split chunks from split_out to final location with proper sequential indices
+    local final_idx f
+    final_idx=0
+    while IFS= read -r -d '' f; do
+        local chunk_idx
+        chunk_idx=$(basename "$f" .txt | sed 's/chunk_//')
+        mv "$f" "$WORK_DIR/seg_$(printf "%03d" "$final_idx").txt"
+        mv "$split_out/chunk_${chunk_idx}.lang" "$WORK_DIR/seg_$(printf "%03d" "$final_idx").lang"
+        final_idx=$((final_idx + 1))
+    done < <(find "$split_out" -maxdepth 1 -name 'chunk_*.txt' -print0 2>/dev/null | sort -z)
+    # Also include any short segments already in work dir (re-index them)
+    while IFS= read -r -d '' f; do
+        local existing_idx dest_txt dest_lang
+        existing_idx=$(basename "$f" .txt | sed 's/seg_//')
+        if [ "$((10#$existing_idx))" -ge "$final_idx" ] 2>/dev/null; then
+            dest_txt="$WORK_DIR/seg_$(printf "%03d" "$final_idx").txt"
+            dest_lang="$WORK_DIR/seg_$(printf "%03d" "$final_idx").lang"
+            if [ "$f" != "$dest_txt" ]; then
+                mv "$f" "$dest_txt"
+                mv "$WORK_DIR/seg_${existing_idx}.lang" "$dest_lang" 2>/dev/null || true
+            fi
+            final_idx=$((final_idx + 1))
+        fi
+    done < <(find "$WORK_DIR" -maxdepth 1 -name 'seg_*.txt' -print0 2>/dev/null | sort -z)
+    rm -rf "$staging" "$split_out"
+    echo "$final_idx"
 }
 SEG_COUNT=$(split_long_segments "$MAX_SEGMENT_CHARS" "$SEG_COUNT")
 
@@ -628,14 +673,13 @@ if [ -n "$OVERRIDE_TEXT" ]; then
     done
 
     # ── Wait for first MP3, then start mpv immediately ──────────────────────
-    FIRST_FILE=""
+    FIRST_FILE="$WORK_DIR/seg_000.mp3"
     for _ in $(seq 1 300); do
-        FIRST_FILE=$(find "$WORK_DIR" -maxdepth 1 -name 'seg_*.mp3' | sort | head -n1)
-        [ -n "$FIRST_FILE" ] && break
+        [ -f "$FIRST_FILE" ] && break
         sleep 0.1
     done
 
-    if [ -z "$FIRST_FILE" ]; then
+    if [ ! -f "$FIRST_FILE" ]; then
         FAILED=0
         for pid in $PIDS; do
             wait "$pid" || FAILED=1
@@ -772,14 +816,13 @@ else
     done
 
     # ── Progressive playback: start mpv on first ready segment ──────────────
-    FIRST_FILE=""
+    FIRST_FILE="$WORK_DIR/seg_000.mp3"
     for _ in $(seq 1 300); do
-        FIRST_FILE=$(find "$WORK_DIR" -maxdepth 1 -name 'seg_*.mp3' | sort | head -n1)
-        [ -n "$FIRST_FILE" ] && break
+        [ -f "$FIRST_FILE" ] && break
         sleep 0.1
     done
 
-    if [ -z "$FIRST_FILE" ]; then
+    if [ ! -f "$FIRST_FILE" ]; then
         FAILED=0
         for pid in $PIDS; do
             wait "$pid" || FAILED=1
