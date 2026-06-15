@@ -135,6 +135,8 @@ class TTSDaemon:
             sys.stderr.write(f'tts-daemon: run {args} failed: {e}\n')
 
     def _on_show_app(self, _item):
+        if subprocess.run(['pgrep', '-f', 'tts-app.py'], capture_output=True).returncode == 0:
+            return  # already running
         app = os.path.join(SCRIPT_DIR, 'tts-app.py')
         self._run(sys.executable, app)
 
@@ -153,6 +155,12 @@ class TTSDaemon:
             pass
 
     def _on_quit(self, _item):
+        if self._lock_fd:
+            try:
+                fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
+                self._lock_fd.close()
+            except OSError:
+                pass
         Gtk.main_quit()
 
 

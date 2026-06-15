@@ -82,6 +82,9 @@ INTERRUPT_FLAG="$TEMP_DIR/speak-aloud.interrupt"
 # Clean up stale interrupt flag from a crashed previous run
 rm -f "$INTERRUPT_FLAG"
 
+# Always reset tray status on exit (covers errors, interrupts, early exits)
+trap 'echo "IDLE" > "$TTS_STATUS_FILE"' EXIT
+
 # Open lock file
 exec 200>"$LOCK_FILE"
 
@@ -763,7 +766,6 @@ if [ -n "$OVERRIDE_TEXT" ]; then
     # "quit" over the socket, which makes this wait return.
     wait "$MPV_PID"
     rm -f "$MPV_SOCKET"
-    echo "IDLE" > "$TTS_STATUS_FILE"
 
     # Export to file if --output was requested
     if [ -n "$OUTPUT_FILE" ]; then
@@ -911,6 +913,5 @@ else
     # "quit" over the socket, which makes this wait return.
     wait "$MPV_PID"
     rm -f "$MPV_SOCKET"
-    echo "IDLE" > "$TTS_STATUS_FILE"
 
 fi
