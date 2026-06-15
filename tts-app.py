@@ -53,14 +53,6 @@ def read_rate(name: str, default: int) -> int:
         return default
 
 
-def read_global_speed(default: float = 1.5) -> float:
-    """Parse the global_speed file into a float, clamped to 0.5–3.0."""
-    try:
-        return max(0.5, min(3.0, float(read_setting('global_speed', str(default)))))
-    except ValueError:
-        return default
-
-
 def read_bool_setting(name: str, default: bool = False) -> bool:
     """Read a yes/no setting file and return a bool."""
     raw = read_setting(name, 'yes' if default else 'no').lower().strip()
@@ -407,7 +399,7 @@ class TTSWindow(Adw.ApplicationWindow):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.set_title('Speak a Loud')
-        self.set_default_size(440, 620)
+        self.set_default_size(440, 800)
 
         # Voice catalog with graceful fallback so a missing/corrupt file doesn't crash.
         # User selections live in ~/.config/tts_settings (shared with CLI tools).
@@ -420,7 +412,6 @@ class TTSWindow(Adw.ApplicationWindow):
         self._state     = AppState.IDLE
         self._is_paused = False
         self._has_audio = False  # Track if audio was successfully generated
-        self._global_speed_value = 1.5  # Plain value for tray thread safety
         self._manager   = TTSManager(
             on_state_change=self._set_state,
             on_error=self._show_error,
@@ -430,6 +421,7 @@ class TTSWindow(Adw.ApplicationWindow):
         self._build_ui()
         self._load_saved_settings()
         self.connect('close-request', self._on_close_request)
+        self.connect('realize', self._resize_to_content)
         GLib.idle_add(self._check_wayland_clipboard)
 
         # Start system-tray icon in background thread
@@ -450,21 +442,17 @@ class TTSWindow(Adw.ApplicationWindow):
         grab_btn.connect('clicked', self._on_grab_clicked)
         hb.pack_start(grab_btn)
 
-        cache_btn = Gtk.Button(icon_name='edit-clear-all-symbolic',
-                               tooltip_text='Clear audio cache')
-        cache_btn.connect('clicked', self._on_clear_cache)
-        hb.pack_end(cache_btn)
         tv.add_top_bar(hb)
 
-        scroll = Gtk.ScrolledWindow(vexpand=True,
-                                    hscrollbar_policy=Gtk.PolicyType.NEVER)
+        self._scroll = Gtk.ScrolledWindow(vexpand=True,
+                                          hscrollbar_policy=Gtk.PolicyType.NEVER)
         clamp = Adw.Clamp(maximum_size=520, tightening_threshold=420)
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=20)
         root.set_margin_top(16);  root.set_margin_bottom(24)
         root.set_margin_start(16); root.set_margin_end(16)
         clamp.set_child(root)
-        scroll.set_child(clamp)
-        tv.set_content(scroll)
+        self._scroll.set_child(clamp)
+        tv.set_content(self._scroll)
 
         # ── Text preview ──────────────────────────────────────────────────────
         preview_group = Adw.PreferencesGroup(title='Selected Text')
@@ -524,11 +512,9 @@ class TTSWindow(Adw.ApplicationWindow):
         self._en_speed_lbl, en_row = self._make_speed_row('English', 50)
         self._ar_speed_lbl, ar_row = self._make_speed_row('Arabic',  30)
         self._de_speed_lbl, de_row = self._make_speed_row('German',  30)
-        global_row = self._make_global_speed_row()
         speed_group.add(en_row)
         speed_group.add(ar_row)
         speed_group.add(de_row)
-        speed_group.add(global_row)
         root.append(speed_group)
 
         # ── Source language ───────────────────────────────────────────────────
@@ -565,6 +551,26 @@ class TTSWindow(Adw.ApplicationWindow):
 
         root.append(trans_group)
 
+        # ── File Actions ──────────────────────────────────────────────────────
+        file_group = Adw.PreferencesGroup(title='File Actions')
+        folder_row = Adw.ActionRow(title='Open Cache Folder')
+        folder_btn = Gtk.Button(label='Open')
+        folder_btn.add_css_class('pill')
+        folder_btn.connect('clicked', self._on_open_folder)
+        folder_row.add_suffix(folder_btn)
+        folder_row.set_activatable_widget(folder_btn)
+        file_group.add(folder_row)
+
+        cache_row = Adw.ActionRow(title='Clear Audio Cache')
+        cache_btn = Gtk.Button(label='Clear')
+        cache_btn.add_css_class('pill')
+        cache_btn.connect('clicked', self._on_clear_cache)
+        cache_row.add_suffix(cache_btn)
+        cache_row.set_activatable_widget(cache_btn)
+        file_group.add(cache_row)
+
+        root.append(file_group)
+
         # ── Controls ──────────────────────────────────────────────────────────
         btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL,
                           spacing=8, homogeneous=True)
@@ -596,6 +602,27 @@ class TTSWindow(Adw.ApplicationWindow):
         self._save_btn.connect('clicked', self._on_save_audio)
         root.append(self._save_btn)
 
+    def _resize_to_content(self, _widget=None):
+        """Resize window to fit all content, capped at 90% of screen height."""
+        def do_resize():
+            # Measure the clamp widget (contains all content)
+            clamp = self._scroll.get_child()
+            if clamp:
+                _, nat_h, _, _ = clamp.measure(Gtk.Orientation.VERTICAL, -1)
+                content_h = nat_h
+            else:
+                content_h = 600
+            # Header bar (~80px) + window decorations (~40px)
+            total_h = content_h + 120
+            # Cap at 90% of screen height
+            monitor = self.get_display().get_monitor_at_surface(self.get_surface())
+            if monitor:
+                max_h = int(monitor.get_geometry().height * 0.9)
+                total_h = min(total_h, max_h)
+            self.set_default_size(440, max(total_h, 500))
+            return GLib.SOURCE_REMOVE
+        GLib.idle_add(do_resize)
+
     def _make_speed_row(self, title: str, default: int):
         lbl = Gtk.Label(label=f'+{default}%  ({(100+default)/100:.1f}×)',
                         width_chars=12, xalign=1.0)
@@ -625,29 +652,6 @@ class TTSWindow(Adw.ApplicationWindow):
         row.set_activatable_widget(scale)
         return lbl, row
 
-    def _make_global_speed_row(self):
-        lbl = Gtk.Label(label='1.5×', width_chars=12, xalign=1.0)
-        lbl.add_css_class('dim-label')
-        self._global_speed_lbl = lbl
-
-        scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0.5, 3.0, 0.1)
-        scale.set_value(1.5)
-        scale.set_draw_value(False)
-        scale.set_hexpand(True)
-        scale.set_size_request(140, -1)
-        scale.connect('value-changed', self._on_global_speed_changed)
-        self._global_scale = scale
-
-        suffix = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL,
-                         spacing=8, valign=Gtk.Align.CENTER)
-        suffix.append(scale)
-        suffix.append(lbl)
-
-        row = Adw.ActionRow(title='Global')
-        row.add_suffix(suffix)
-        row.set_activatable_widget(scale)
-        return row
-
     def _load_saved_settings(self):
         """Load selections from ~/.config/tts_settings (shared with CLI tools)."""
         def voice_index(voices, saved_id):
@@ -672,11 +676,6 @@ class TTSWindow(Adw.ApplicationWindow):
         self._en_speed_lbl.set_label(f'+{en_spd}%  ({(100+en_spd)/100:.1f}×)')
         self._ar_speed_lbl.set_label(f'+{ar_spd}%  ({(100+ar_spd)/100:.1f}×)')
         self._de_speed_lbl.set_label(f'+{de_spd}%  ({(100+de_spd)/100:.1f}×)')
-
-        global_spd = read_global_speed()
-        self._global_speed_value = global_spd
-        self._global_scale.set_value(global_spd)
-        self._global_speed_lbl.set_label(f'{global_spd:.1f}×')
 
         # Source language
         saved_src = read_setting('source_language', 'auto')
@@ -750,15 +749,8 @@ class TTSWindow(Adw.ApplicationWindow):
         val = int(scale.get_value())
         mpv_speed = (100 + val) / 100
         lbl.set_label(f'+{val}%  ({mpv_speed:.1f}×)')
-        if self._state == AppState.PLAYING:
-            self._manager.send_mpv(['set_property', 'speed', round(mpv_speed, 3)])
-
-    def _on_global_speed_changed(self, scale):
-        speed = round(scale.get_value(), 3)
-        self._global_speed_value = speed
-        self._global_speed_lbl.set_label(f'{speed:.1f}×')
-        if self._state == AppState.PLAYING:
-            self._manager.send_mpv(['set_property', 'speed', speed])
+        # NOTE: Per-language rates only affect edge-tts generation.
+        # Live playback speed is controlled solely by global speed slider.
 
     def _on_trans_enabled_changed(self, switch, state):
         self._trans_provider_combo.set_sensitive(state)
@@ -817,7 +809,6 @@ class TTSWindow(Adw.ApplicationWindow):
         en_rate  = f"+{int(self._en_scale.get_value())}%"
         ar_rate  = f"+{int(self._ar_scale.get_value())}%"
         de_rate  = f"+{int(self._de_scale.get_value())}%"
-        speed    = round(self._global_scale.get_value(), 3)
 
         src_lang = SOURCE_LANGUAGES[self._source_lang_combo.get_selected()][0]
         trans_enabled = 'yes' if self._trans_enabled.get_active() else 'no'
@@ -837,7 +828,6 @@ class TTSWindow(Adw.ApplicationWindow):
             '--en-rate',  en_rate,
             '--ar-rate',  ar_rate,
             '--de-rate',  de_rate,
-            '--speed',    str(speed),
             '--source-lang', src_lang,
             '--translate-enabled', trans_enabled,
             '--translate-provider', trans_provider,
@@ -876,8 +866,6 @@ class TTSWindow(Adw.ApplicationWindow):
         en_voice = self.config['voices']['english'][en_idx]['id']
         ar_voice = self.config['voices']['arabic'][ar_idx]['id']
         de_voice = self.config['voices']['german'][de_idx]['id']
-        global_speed = round(self._global_scale.get_value(), 3)
-
         settings = {
             'voice':        en_voice,
             'arabic_voice': ar_voice,
@@ -885,7 +873,6 @@ class TTSWindow(Adw.ApplicationWindow):
             'rate':         f'+{en_rate}%',
             'arabic_rate':  f'+{ar_rate}%',
             'german_rate':  f'+{de_rate}%',
-            'global_speed': str(global_speed),
             'source_language': src_lang,
             'translate_enabled': trans_enabled,
             'translate_provider': trans_provider,
@@ -975,6 +962,14 @@ class TTSWindow(Adw.ApplicationWindow):
         except Exception as e:
             self._show_error(f'Failed to save audio: {e}')
 
+    def _on_open_folder(self, _btn):
+        cache_dir = os.path.expanduser('~/.cache/speak-aloud')
+        try:
+            os.makedirs(cache_dir, exist_ok=True)
+            subprocess.run(['xdg-open', cache_dir], check=False)
+        except Exception as e:
+            self._show_error(f'Failed to open folder: {e}')
+
     def _on_clear_cache(self, _btn):
         cache_dir = os.path.expanduser('~/.cache/speak-aloud')
         try:
@@ -1056,18 +1051,6 @@ class TTSWindow(Adw.ApplicationWindow):
             icon.stop()
             GLib.idle_add(self._quit_app)
 
-        def on_speed(speed):
-            def _apply():
-                self._global_scale.set_value(speed)
-                self._persist_global_speed(speed)
-                self._manager.send_mpv(['set_property', 'speed', round(speed, 2)])
-                return GLib.SOURCE_REMOVE
-
-            def _fn(icon, _item):
-                if not self._tray_shutdown.is_set():
-                    GLib.idle_add(_apply)
-            return _fn
-
         def on_seek(offset):
             def _fn(icon, _item):
                 if not self._tray_shutdown.is_set():
@@ -1077,26 +1060,11 @@ class TTSWindow(Adw.ApplicationWindow):
                         self._manager.send_mpv(['set_property', 'time-pos', new_pos])
             return _fn
 
-        speeds = [0.5, 1.0, 1.25, 1.5, 2.0, 2.5]
-        speed_items = [
-            pystray.MenuItem(
-                f'{s}×',
-                on_speed(s),
-                # Read the live slider so the checkmark follows speed changes
-                checked=lambda item, s=s: abs(
-                    self._global_speed_value - s
-                ) < 0.01,
-            )
-            for s in speeds
-        ]
-
         return pystray.Menu(
             pystray.MenuItem('Show TTS App', on_show),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(lambda item: self._tray_play_text(), on_toggle),
             pystray.MenuItem('⏹  Stop', on_stop),
-            pystray.Menu.SEPARATOR,
-            pystray.MenuItem('Speed', pystray.Menu(*speed_items)),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem('⏪  -10s', on_seek(-10)),
             pystray.MenuItem('⏩  +10s', on_seek(10)),
@@ -1109,15 +1077,6 @@ class TTSWindow(Adw.ApplicationWindow):
         if not state:
             return '▶  Play'
         return '⏸  Pause' if not state.get('paused') else '▶  Play'
-
-    def _persist_global_speed(self, speed: float):
-        self._global_speed_value = speed
-        try:
-            os.makedirs(SHELL_CFG_DIR, exist_ok=True)
-            with open(os.path.join(SHELL_CFG_DIR, 'global_speed'), 'w') as f:
-                f.write(str(round(speed, 3)))
-        except OSError:
-            pass
 
     def _quit_app(self):
         self._tray_shutdown.set()  # Signal tray thread to stop
