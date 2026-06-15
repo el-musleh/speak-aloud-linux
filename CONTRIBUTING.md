@@ -1,10 +1,10 @@
 # Contributing to Speak a Loud Universal
 
-Thank you for your interest in improving Speak a Loud! We follow a structured development process to ensure stability across both the Python UI and Bash backend.
+Thank you for your interest in improving Speak a Loud! We follow a structured development process to ensure stability across the Bash backend and YAD settings GUI.
 
 ## 📐 Development Principles
 
-1.  **Non-Blocking UI:** Always perform I/O (sockets, files, subprocesses) in background threads. Use `GLib.idle_add` to sync results back to the GTK main loop.
+1.  **Non-Blocking:** Always perform I/O (sockets, files, subprocesses) in background threads where needed.
 2.  **Surgical Scripting:** Keep `speak.sh` lightweight. It should be usable as a standalone CLI tool without any GUI dependencies.
 3.  **Process Integrity:** Always clean up child processes. If you launch a subprocess, ensure it is part of a process group that is killed on exit.
 
@@ -24,11 +24,8 @@ Before submitting a pull request, please verify:
 # Check shell scripts for syntax errors
 bash -n *.sh
 
-# Check Python app for syntax errors
-python3 -m py_compile tts-app.py
 ```
 
 ### Manual Test Suite:
 1.  **Bilingual Switch:** Test with text containing both Arabic and English.
-2.  **Real-time Speed:** Adjust the GUI slider while audio is playing.
-3.  **Shortcut Sync:** Change settings in the GUI, close it, and then run `speak.sh` to confirm the settings persisted.
+2.  **Shortcut Sync:** Change settings in `tts-settings.sh`, then run `speak.sh` to confirm the settings persisted.

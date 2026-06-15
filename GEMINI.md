@@ -4,28 +4,28 @@ Speak a Loud Universal is a specialized Text-to-Speech (TTS) toolkit for Linux, 
 
 ## Project Overview
 
-The project is a hybrid of Python and Bash, providing two main interaction patterns:
-1.  **GUI Mode:** A modern GTK4/Libadwaita application (`tts-app.py`) for previewing text, selecting voices, and adjusting speed in real-time.
-2.  **Shortcut Mode:** Minimalist shell scripts (`speak.sh`, `speak-pause.sh`) intended to be bound to global keyboard shortcuts for instant reading of highlighted text.
+Speak a Loud Universal is a shell-first TTS toolkit with a YAD-based settings GUI. The primary interaction patterns are:
+1.  **Keyboard Shortcut:** `speak.sh` reads the current text selection and speaks it immediately.
+2.  **Settings GUI:** `tts-settings.sh` (YAD) configures voices, rates, translation, and pauses.
+3.  **Tray Daemon:** `tts-daemon.py` provides a cross-desktop tray icon (via `pystray`) with play/pause/stop/seek controls, desktop notifications, structured logging, and optional media-key support (gated to active TTS playback).
 
 ### Core Technologies
 - **Speech Engine:** `edge-tts` (Python)
-- **Playback & Control:** `mpv` with Unix IPC socket support (`/tmp/mpvsocket`).
-- **GUI Framework:** GTK4 + Libadwaita (via PyGObject/`gi`).
-- **Text Processing:** Python-based regex segmentation for English/Arabic detection.
+- **Playback & Control:** `mpv` with Unix IPC socket support (`/tmp/speak-aloud-mpv.sock`).
+- **Settings GUI:** `yad` (shell-based GTK dialog).
+- **Text Processing:** Python-based regex segmentation for English/Arabic/German detection.
 - **System Integration:** `xsel` (X11) and `wl-clipboard` (Wayland) for clipboard access; `socat` for IPC.
 
 ## Architecture
 
 - **`speak.sh`**: The central orchestration script.
     - Segments input text into language-specific blocks.
-    - In **Shortcut Mode**, it generates and plays audio segments sequentially.
-    - In **GUI Mode** (triggered by `--text`), it generates all segments first, then starts a single `mpv` instance with an IPC server to allow real-time control from the Python app.
-- **`tts-app.py`**: The primary user interface.
-    - Uses a `TTSManager` to manage the lifecycle of `speak.sh` subprocesses.
-    - Communicates with `mpv` via JSON-IPC to handle pausing and real-time speed adjustments.
-    - Implements asynchronous clipboard grabbing to prevent UI freezes.
-- **`config.json`**: Central repository for available voices and default settings.
+    - Generates and plays audio segments with progressive playback (starts mpv as soon as the first segment is ready).
+    - Supports `--output` for exporting concatenated MP3.
+- **`tts-settings.sh`**: The settings GUI.
+    - YAD form for voice selection, per-language rate sliders, translation config, and pause-at-punctuation settings.
+    - Writes all values to `~/.config/tts_settings/` so `speak.sh` sees them immediately.
+- **`tts-shared.json`**: Central repository for available voices and default settings.
 - **`install.sh`**: Handles system dependency resolution (`apt`), Python package management (`pipx`), and initial configuration.
 
 ## Building and Running
@@ -37,18 +37,14 @@ chmod +x install.sh
 ```
 
 ### Running the Application
-- **Main GUI:** `python3 tts-app.py`
-- **CLI/Shortcut:** `./speak.sh` (Reads current selection)
+- **Speak Selection:** `./speak.sh` (reads current selection via keyboard shortcut)
 - **Toggle Pause:** `./speak-pause.sh`
-- **Legacy Settings:** `./tts-settings.sh` (Requires `yad`)
+- **Stop Speech:** `./speak-stop.sh`
+- **Settings:** `./tts-settings.sh` (requires `yad`)
 
 ## Development Conventions
 
-- **Concurrency:** Never block the GTK main loop. Use `threading.Thread` for I/O bound tasks (clipboard, subprocess, socket) and `GLib.idle_add` to update the UI from background threads.
-- **Process Management:** Use `os.killpg` with `signal.SIGKILL` to ensure that `speak.sh` and its child processes (`edge-tts`, `mpv`) are fully terminated when a new speech request is made or the app closes.
-- **IPC:** Playback control must be performed by sending JSON-formatted commands to `/tmp/mpvsocket`.
+- **Process Management:** `speak.sh` uses process groups and flock-based session locking to ensure clean termination of all child processes (`edge-tts`, `mpv`) when a new speech request is made.
+- **IPC:** Playback control is performed by sending JSON-formatted commands to `/tmp/speak-aloud-mpv.sock`.
 - **Language Detection:** The project uses a specific Unicode-range regex for Arabic (`[؀-ۿݐ-ݿﭐ-﷿ﹰ-﻿]`). Any segmenting logic should respect this to ensure correct voice assignment.
-- **Configuration Persistence:**
-    - Python settings are saved to `config.json`.
-    - Shell scripts read settings from `~/.config/tts_settings/`.
-    - `tts-app.py` is responsible for syncing its internal state to the shell config files during speech generation.
+- **Configuration Persistence:** All settings live as plain files in `~/.config/tts_settings/` — shared between `tts-settings.sh`, `speak.sh`, and the tray daemon.

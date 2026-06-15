@@ -4,6 +4,13 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export PATH="$SCRIPT_DIR/bin:$PATH"
 
+# ── Ensure tray daemon is running ────────────────────────────────────────────
+# Auto-start the daemon on every speak invocation so the tray icon
+# is always present (handles cases where the user quit it earlier).
+if ! pgrep -f "tts-daemon.py" > /dev/null 2>&1; then
+    python3 "$SCRIPT_DIR/tts-daemon.py" > /dev/null 2>&1 &
+fi
+
 CONFIG_DIR="$HOME/.config/tts_settings"
 # Use system temp directory for portability
 TEMP_DIR="${TMPDIR:-/tmp}"

@@ -1,55 +1,129 @@
 #!/usr/bin/env python3
 """
-TTS Tray Daemon — always-running GTK3 tray icon for Cinnamon.
+TTS Tray Daemon — cross-desktop tray icon with media keys, notifications, and logging.
 
-Polls /tmp/tts-status (written by speak.sh) every 500ms and updates
-the XApp.StatusIcon accordingly.  Menu actions call speak-pause.sh and
-speak-stop.sh directly — no sockets, no IPC, no race conditions.
+Uses pystray for the tray icon (works on Cinnamon, GNOME, KDE, XFCE).
+Listens to media keys only while TTS is actively playing.
+Sends desktop notifications on state changes.
+Logs to ~/.local/share/speak-aloud/daemon.log with rotation.
 
 Auto-started on login via ~/.config/autostart/tts-daemon.desktop.
 Single-instance enforced via /tmp/tts-daemon.lock.
 """
 
-import gi
-gi.require_version('Gtk', '3.0')
-gi.require_version('XApp', '1.0')
-from gi.repository import Gtk, GLib, XApp
-
 import fcntl
+import logging
+import logging.handlers
 import os
 import subprocess
 import sys
+import threading
+import time
+
+from PIL import Image, ImageDraw
+
+# Optional media-key support
+try:
+    from pynput import keyboard
+    PYNPUT_AVAILABLE = True
+except ImportError:
+    PYNPUT_AVAILABLE = False
+
+import pystray
 
 SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
 STATUS_FILE = '/tmp/tts-status'
 LOCK_FILE   = '/tmp/tts-daemon.lock'
 MPV_SOCKET  = '/tmp/speak-aloud-mpv.sock'
+LOG_DIR     = os.path.expanduser('~/.local/share/speak-aloud')
+LOG_FILE    = os.path.join(LOG_DIR, 'daemon.log')
 
 _STATE_LABELS = {
     'IDLE':       '○  Ready',
     'GENERATING': '⟳  Generating…',
     'RETRYING':   '⟳  Retrying…',
     'PLAYING':    '♪  Playing',
+    'PAUSED':     '⏸  Paused',
 }
 
-_STATE_ICONS = {
-    'IDLE':       'audio-speakers',
-    'GENERATING': 'emblem-synchronizing',
-    'RETRYING':   'network-error',
-    'PLAYING':    'audio-volume-high',
+_NOTIFICATIONS = {
+    'GENERATING': ('TTS: Generating audio…', 'emblem-synchronizing'),
+    'PLAYING':    ('TTS: Now speaking', 'audio-volume-high'),
+    'PAUSED':     ('TTS: Paused', 'media-playback-pause'),
+    'IDLE':       ('TTS: Finished speaking', 'audio-speakers'),
+    'RETRYING':   ('TTS: Retrying…', 'network-error'),
 }
+
+
+def _setup_logging():
+    os.makedirs(LOG_DIR, exist_ok=True)
+    logger = logging.getLogger('tts-daemon')
+    logger.setLevel(logging.DEBUG)
+
+    fh = logging.handlers.RotatingFileHandler(
+        LOG_FILE, maxBytes=1_048_576, backupCount=1
+    )
+    fh.setFormatter(logging.Formatter(
+        '%(asctime)s [%(levelname)s] %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    ))
+
+    ch = logging.StreamHandler(sys.stderr)
+    ch.setFormatter(logging.Formatter('%(levelname)s: %(message)s'))
+
+    logger.addHandler(fh)
+    logger.addHandler(ch)
+    return logger
+
+
+def _create_icon():
+    """Generate a simple speaker icon."""
+    img = Image.new('RGBA', (64, 64), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    draw.rectangle([12, 20, 28, 44], fill=(50, 150, 250, 255))
+    draw.polygon([(28, 14), (28, 50), (48, 32)], fill=(50, 150, 250, 255))
+    return img
+
+
+def _notify(title, icon='audio-speakers'):
+    try:
+        subprocess.run(
+            ['notify-send', '--icon', icon, '--expire-time', '3000', title],
+            capture_output=True, timeout=5
+        )
+    except Exception:
+        pass
+
+
+def _send_mpv(cmd):
+    try:
+        payload = '{"command":' + str(cmd).replace("'", '"') + '}\n'
+        subprocess.run(
+            ['socat', '-', MPV_SOCKET],
+            input=payload.encode(), capture_output=True, timeout=1
+        )
+    except Exception:
+        pass
 
 
 class TTSDaemon:
     def __init__(self):
-        self._current_state = ''
-        self._icon = None
+        self.log = _setup_logging()
+        self._state = 'IDLE'
+        self._last_notify = None
+        self._listener = None
         self._lock_fd = None
-        self._acquire_lock()
-        self._build_icon()
-        GLib.timeout_add(500, self._poll_status)
 
-    # ── Single-instance lock ───────────────────────────────────────────────────
+        self._acquire_lock()
+        self.log.info('Daemon started (PID %d)', os.getpid())
+
+        self._build_icon()
+        self._start_poll()
+
+        if PYNPUT_AVAILABLE:
+            self.log.debug('pynput available')
+        else:
+            self.log.warning('pynput not installed; media keys disabled')
 
     def _acquire_lock(self):
         try:
@@ -59,114 +133,153 @@ class TTSDaemon:
             fd.flush()
             self._lock_fd = fd
         except (IOError, OSError):
-            sys.stderr.write('tts-daemon: already running, exiting.\n')
+            self.log.error('Already running — exiting')
             sys.exit(0)
 
-    # ── Tray icon ──────────────────────────────────────────────────────────────
-
     def _build_icon(self):
-        icon = XApp.StatusIcon()
-        icon.set_icon_name('audio-speakers')
-        icon.set_tooltip_text('Speak a Loud — ○ Ready')
-        icon.set_label('')
-        icon.set_visible(True)
-        self._icon = icon
-        self._rebuild_menu('IDLE')
+        menu = pystray.Menu(
+            pystray.MenuItem('Show Settings', self._on_show),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem('Play / Pause', self._on_pause),
+            pystray.MenuItem('Stop', self._on_stop),
+            pystray.MenuItem('Seek -10s', self._on_seek_back),
+            pystray.MenuItem('Seek +10s', self._on_seek_forward),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem('Quit', self._on_quit),
+        )
 
-    def _rebuild_menu(self, state: str):
-        label = _STATE_LABELS.get(state, '○  Ready')
+        self._icon = pystray.Icon(
+            'tts-daemon',
+            icon=_create_icon(),
+            title='Speak a Loud — ○ Ready',
+            menu=menu
+        )
 
-        status_item = Gtk.MenuItem(label=label)
-        status_item.set_sensitive(False)
+    def _start_poll(self):
+        def loop():
+            while self._icon.running:
+                self._tick()
+                time.sleep(0.5)
+        threading.Thread(target=loop, daemon=True).start()
 
-        show_item = Gtk.MenuItem(label='Show App')
-        show_item.connect('activate', self._on_show_app)
-
-        pause_item = Gtk.MenuItem(label='Play / Pause')
-        pause_item.connect('activate', self._on_pause)
-
-        stop_item = Gtk.MenuItem(label='Stop')
-        stop_item.connect('activate', self._on_stop)
-
-        quit_item = Gtk.MenuItem(label='Quit Daemon')
-        quit_item.connect('activate', self._on_quit)
-
-        menu = Gtk.Menu()
-        for w in [status_item,
-                  Gtk.SeparatorMenuItem(),
-                  show_item,
-                  Gtk.SeparatorMenuItem(),
-                  pause_item,
-                  stop_item,
-                  Gtk.SeparatorMenuItem(),
-                  quit_item]:
-            menu.append(w)
-        menu.show_all()
-
-        self._icon.set_primary_menu(menu)
-        self._icon.set_secondary_menu(menu)
-
-    # ── Status polling ─────────────────────────────────────────────────────────
-
-    def _poll_status(self):
+    def _tick(self):
         try:
             with open(STATUS_FILE) as f:
                 state = f.read().strip()
         except (FileNotFoundError, OSError):
             state = 'IDLE'
 
-        if state != self._current_state:
-            self._current_state = state
+        if state != self._state:
+            self._state = state
             label = _STATE_LABELS.get(state, '○  Ready')
-            icon  = _STATE_ICONS.get(state, 'audio-speakers')
-            self._icon.set_icon_name(icon)
-            self._icon.set_tooltip_text(f'Speak a Loud — {label}')
-            self._rebuild_menu(state)
+            self._icon.title = f'Speak a Loud — {label}'
+            self.log.info('State: %s', state)
+            self._do_notify(state)
+            self._sync_media_keys(state)
 
-        return GLib.SOURCE_CONTINUE  # keep polling
+    def _do_notify(self, state):
+        if state == self._last_notify:
+            return
+        self._last_notify = state
+        info = _NOTIFICATIONS.get(state)
+        if info:
+            _notify(info[0], info[1])
 
-    # ── Menu actions ───────────────────────────────────────────────────────────
+    def _sync_media_keys(self, state):
+        if not PYNPUT_AVAILABLE:
+            return
+        active = state in ('PLAYING', 'PAUSED')
+        if active and self._listener is None:
+            self._start_keys()
+        elif not active and self._listener is not None:
+            self._stop_keys()
 
-    def _run(self, *args):
+    def _start_keys(self):
         try:
-            subprocess.Popen(list(args), stdout=subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL)
+            self._listener = keyboard.Listener(on_press=self._on_key)
+            self._listener.start()
+            self.log.debug('Media keys active')
         except Exception as e:
-            sys.stderr.write(f'tts-daemon: run {args} failed: {e}\n')
+            self.log.warning('Media keys failed: %s', e)
+            self._listener = None
 
-    def _on_show_app(self, _item):
-        if subprocess.run(['pgrep', '-f', 'tts-app.py'], capture_output=True).returncode == 0:
-            return  # already running
-        app = os.path.join(SCRIPT_DIR, 'tts-app.py')
-        self._run(sys.executable, app)
+    def _stop_keys(self):
+        if self._listener:
+            try:
+                self._listener.stop()
+            except Exception:
+                pass
+            self._listener = None
+            self.log.debug('Media keys released')
 
-    def _on_pause(self, _item):
-        pause_sh = os.path.join(SCRIPT_DIR, 'speak-pause.sh')
-        self._run('bash', pause_sh)
+    def _on_key(self, key):
+        try:
+            name = getattr(key, 'name', None)
+            if name in ('media_play_pause', 'play_pause'):
+                self._on_pause()
+            elif name == 'media_stop':
+                self._on_stop()
+            elif name in ('media_previous', 'previous'):
+                self._on_seek_back()
+            elif name in ('media_next', 'next'):
+                self._on_seek_forward()
+        except Exception as e:
+            self.log.error('Key handler error: %s', e)
 
-    def _on_stop(self, _item):
-        stop_sh = os.path.join(SCRIPT_DIR, 'speak-stop.sh')
-        self._run('bash', stop_sh)
-        # Immediately reflect IDLE in the tray
+    def _run(self, script):
+        path = os.path.join(SCRIPT_DIR, script)
+        self.log.info('Run: %s', script)
+        try:
+            subprocess.Popen(
+                ['bash', path],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+        except Exception as e:
+            self.log.error('Failed to run %s: %s', script, e)
+
+    def _on_show(self, icon, item):
+        if subprocess.run(['pgrep', '-f', 'tts-settings.sh'],
+                         capture_output=True).returncode == 0:
+            return
+        self._run('tts-settings.sh')
+
+    def _on_pause(self, icon=None, item=None):
+        self._run('speak-pause.sh')
+
+    def _on_stop(self, icon=None, item=None):
+        self._run('speak-stop.sh')
         try:
             with open(STATUS_FILE, 'w') as f:
                 f.write('IDLE')
         except OSError:
             pass
 
-    def _on_quit(self, _item):
+    def _on_seek_back(self, icon=None, item=None):
+        self.log.info('Seek -10s')
+        _send_mpv(['seek', '-10'])
+
+    def _on_seek_forward(self, icon=None, item=None):
+        self.log.info('Seek +10s')
+        _send_mpv(['seek', '10'])
+
+    def _on_quit(self, icon, item):
+        self.log.info('Quit requested')
+        self._stop_keys()
         if self._lock_fd:
             try:
                 fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
                 self._lock_fd.close()
             except OSError:
                 pass
-        Gtk.main_quit()
+        self._icon.stop()
+
+    def run(self):
+        self._icon.run()
 
 
 def main():
-    daemon = TTSDaemon()
-    Gtk.main()
+    TTSDaemon().run()
 
 
 if __name__ == '__main__':
