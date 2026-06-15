@@ -25,6 +25,8 @@ OVERRIDE_TRANSLATE_ENABLED=""  # optional: yes/no
 OVERRIDE_TRANSLATE_PROVIDER="" # optional: deepl, google
 OVERRIDE_TRANSLATE_TARGET=""   # optional: target language code
 OVERRIDE_TRANSLATE_KEY=""  # optional: API key string
+OVERRIDE_PAUSE_PUNCTUATION=""  # optional: yes/no
+OVERRIDE_PAUSE_DELAY_MS=""   # optional: pause delay in milliseconds (default 100)
 
 show_help() {
     cat << 'EOF'
@@ -45,6 +47,8 @@ Options:
   --translate-provider     Translation provider (deepl, google)
   --translate-target LANG  Target language for translation
   --translate-api-key KEY  API key for translation service
+  --pause-punctuation yes/no Enable/disable punctuation pauses
+  --pause-delay-ms MS      Pause delay between segments in ms (default 300)
   --help                   Show this help message
 
 Audio file locations:
@@ -69,6 +73,8 @@ while [[ $# -gt 0 ]]; do
         --translate-provider) OVERRIDE_TRANSLATE_PROVIDER="$2"; shift 2 ;;
         --translate-target)  OVERRIDE_TRANSLATE_TARGET="$2";  shift 2 ;;
         --translate-api-key) OVERRIDE_TRANSLATE_KEY="$2"; shift 2 ;;
+        --pause-punctuation) OVERRIDE_PAUSE_PUNCTUATION="$2"; shift 2 ;;
+        --pause-delay-ms) OVERRIDE_PAUSE_DELAY_MS="$2"; shift 2 ;;
         --help)     show_help; exit 0 ;;
         *) shift ;;
     esac
@@ -93,7 +99,19 @@ if ! flock -n 200 2>/dev/null; then
     # Another instance is running — ask it to stop and wait for the lock.
     touch "$INTERRUPT_FLAG"
     if [ -S "$MPV_SOCKET" ]; then
-        echo '{"command":["quit"]}' | socat - "$MPV_SOCKET" 2>/dev/null
+        # Socket exists: ask mpv to quit gracefully
+        echo '{"command":["quit"]}' | socat - "$MPV_SOCKET" 2>/dev/null >/dev/null
+    else
+        # Socket is gone but lock is held: previous instance is stuck waiting
+        # for a dead/ghost mpv.  Kill the whole process group to release it.
+        pkill -f "mpv .*--input-ipc-server=$MPV_SOCKET" 2>/dev/null || true
+        # Also SIGTERM any speak.sh holding the same lock file
+        for pid in $(lsof -t "$LOCK_FILE" 2>/dev/null); do
+            if [ "$pid" != "$$" ]; then
+                kill -TERM -"$pid" 2>/dev/null || true
+            fi
+        done
+        sleep 0.5
     fi
     # Block up to 5 seconds for the previous instance to release the lock
     if ! flock -w 5 200 2>/dev/null; then
@@ -148,6 +166,15 @@ validate_text() {
     # Remove ASCII control characters only — must NOT touch bytes >= 0x80,
     # otherwise multibyte UTF-8 (Arabic, umlauts, …) would be destroyed.
     text=$(printf '%s' "$text" | tr -d '\000-\010\013\014\016-\037\177')
+    # Strip Unicode bidirectional formatting characters (LTR/RTL marks,
+    # embeddings, overrides, pop directional formatting) that confuse TTS
+    # engines and fragment copied text from PDFs/web pages.
+    text=$(printf '%s' "$text" | python3 -c '
+import sys
+t = sys.stdin.read()
+t = t.translate({0x200E:None, 0x200F:None, 0x202A:None, 0x202B:None, 0x202C:None, 0x202D:None, 0x202E:None})
+print(t, end="")
+')
     # Limit to reasonable length (10000 chars)
     if [ ${#text} -gt 10000 ]; then
         echo "Text too long (${#text} chars), truncating to 10000" >&2
@@ -191,6 +218,12 @@ TRANSLATE_ENABLED="${OVERRIDE_TRANSLATE_ENABLED:-$(cat "$CONFIG_DIR/translate_en
 TRANSLATE_PROVIDER="${OVERRIDE_TRANSLATE_PROVIDER:-$(cat "$CONFIG_DIR/translate_provider" 2>/dev/null || echo "deepl")}"
 TRANSLATE_TARGET="${OVERRIDE_TRANSLATE_TARGET:-$(cat "$CONFIG_DIR/translate_target" 2>/dev/null || echo "")}"
 TRANSLATE_KEY="${OVERRIDE_TRANSLATE_KEY:-$(cat "$CONFIG_DIR/translate_api_key" 2>/dev/null || echo "")}"
+PAUSE_PUNCTUATION="${OVERRIDE_PAUSE_PUNCTUATION:-$(cat "$CONFIG_DIR/pause_punctuation" 2>/dev/null || echo "yes")}"
+PAUSE_DELAY_MS="${OVERRIDE_PAUSE_DELAY_MS:-$(cat "$CONFIG_DIR/pause_delay_ms" 2>/dev/null || echo "100")}"
+# Validate pause delay (0–2000 ms)
+if ! [[ "$PAUSE_DELAY_MS" =~ ^[0-9]+$ ]] || [ "$PAUSE_DELAY_MS" -lt 0 ] || [ "$PAUSE_DELAY_MS" -gt 2000 ]; then
+    PAUSE_DELAY_MS=100
+fi
 
 # ── Cache helpers ─────────────────────────────────────────────────────────────
 CACHE_DIR="$HOME/.cache/speak-aloud"
@@ -224,6 +257,28 @@ cache_store() {
     local src="$1" dest="$2" tmp
     tmp="${dest}.tmp.$$"
     cp "$src" "$tmp" && mv "$tmp" "$dest"
+}
+
+# Generate (or reuse cached) a silent MP3 of a given duration in milliseconds.
+# Args: delay_ms  Returns path to the silence file.
+silence_file_for_delay() {
+    local ms="$1"
+    local dest="$CACHE_DIR/silence_${ms}ms.mp3"
+    if [ -f "$dest" ]; then
+        echo "$dest"
+        return 0
+    fi
+    local tmp="${dest}.tmp.$$"
+    local sec
+    sec=$(printf '%s.%s' "$((ms / 1000))" "$((ms % 1000 / 10))")
+    if ffmpeg -y -f lavfi -i "anullsrc=r=24000:cl=mono" -t "$sec" -acodec libmp3lame -q:a 9 "$tmp" 2>/dev/null; then
+        mv "$tmp" "$dest"
+        echo "$dest"
+        return 0
+    fi
+    rm -f "$tmp"
+    echo ""
+    return 1
 }
 
 # Runs edge-tts with retry and real error parsing.
@@ -318,7 +373,7 @@ else
 # ── Split text into language segments ─────────────────────────────────────────
 PY_SCRIPT=$(mktemp)
 cat > "$PY_SCRIPT" <<'PYEOF'
-import sys, re
+import sys, re, unicodedata
 
 text, workdir = sys.argv[1], sys.argv[2]
 
@@ -466,9 +521,36 @@ for item in raw_segs:
         continue
     segs.extend(classify_block(chunk))
 
-# Skip segments that contain only whitespace / punctuation (no letters to speak)
-import unicodedata
+# Merge digit/punctuation-only segments with adjacent Arabic segments.
+# Western numerals (0-9) embedded in Arabic text should be spoken in Arabic.
+def is_non_letter_chunk(s):
+    s = s.strip()
+    if not s:
+        return False
+    for ch in s:
+        if unicodedata.category(ch)[0] == 'L':
+            return False
+    return any(unicodedata.category(ch)[0] == 'N' for ch in s)
 
+merged_digits = []
+i = 0
+while i < len(segs):
+    lang, chunk = segs[i]
+    if lang in ('en', 'de') and is_non_letter_chunk(chunk):
+        if merged_digits and merged_digits[-1][0] == 'ar':
+            pl, pc = merged_digits[-1]
+            merged_digits[-1] = ('ar', pc + ' ' + chunk)
+        elif i + 1 < len(segs) and segs[i + 1][0] == 'ar':
+            nl, nc = segs[i + 1]
+            segs[i + 1] = ('ar', chunk + ' ' + nc)
+        else:
+            merged_digits.append((lang, chunk))
+    else:
+        merged_digits.append((lang, chunk))
+    i += 1
+segs = merged_digits
+
+# Skip segments that contain only whitespace / punctuation (no letters to speak)
 def speakable_count(s):
     return sum(1 for ch in s if unicodedata.category(ch)[0] in ('L', 'N'))
 
@@ -530,6 +612,104 @@ SEG_COUNT=$(python3 "$PY_SCRIPT" "$TEXT" "$WORK_DIR")
 rm -f "$PY_SCRIPT"
 
 fi  # end of source-language override / auto-detection block
+
+# ── Split segments at major punctuation for natural pauses ────────────────────
+# When pause_punctuation is enabled, break each segment at commas, periods,
+# semicolons, colons, exclamation/question marks (including Arabic equivalents)
+# so edge-tts generates each phrase with proper cadence.
+split_punctuation_segments() {
+    local workdir="$1" old_count="$2"
+    local py_script
+    py_script=$(mktemp)
+    cat > "$py_script" <<'PYEOF'
+import sys, re, os, unicodedata
+
+def speakable_count(s):
+    return sum(1 for ch in s if unicodedata.category(ch)[0] in ('L', 'N'))
+
+workdir = sys.argv[1]
+seg_count = int(sys.argv[2])
+
+# Split at major punctuation followed by whitespace.
+# Arabic equivalents included: ، ؛ ؟ 。
+# Avoid splitting at decimal points (e.g., 3.14).
+PUNCT_RE = re.compile(r'(?<=[,;:!?،؛؟。])\s+|(?<=\.)\s+(?!\d)')
+
+def split_at_punct(text):
+    parts = PUNCT_RE.split(text)
+    return [p.strip() for p in parts if p.strip()]
+
+new_segs = []
+for i in range(seg_count):
+    txt_path = os.path.join(workdir, f'seg_{i:03d}.txt')
+    lang_path = os.path.join(workdir, f'seg_{i:03d}.lang')
+    if not os.path.exists(txt_path):
+        continue
+    with open(txt_path, 'r') as f:
+        text = f.read()
+    lang = 'en'
+    if os.path.exists(lang_path):
+        with open(lang_path, 'r') as f:
+            lang = f.read().strip()
+
+    chunks = split_at_punct(text)
+
+    # Merge small chunks with neighbors to avoid NoAudioReceived
+    merged = []
+    buffer = ''
+    for chunk in chunks:
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if speakable_count(chunk) >= 2:
+            if buffer:
+                chunk = buffer + ' ' + chunk
+                buffer = ''
+            merged.append(chunk)
+        else:
+            if merged:
+                merged[-1] = merged[-1] + ' ' + chunk
+            else:
+                buffer = (buffer + ' ' + chunk).strip() if buffer else chunk
+
+    if buffer and merged:
+        merged[-1] = merged[-1] + ' ' + buffer
+    elif buffer:
+        merged.append(buffer)
+
+    for chunk in merged:
+        if speakable_count(chunk) >= 2:
+            new_segs.append((lang, chunk))
+
+# Remove old segment files
+for i in range(seg_count):
+    for ext in ('.txt', '.lang'):
+        p = os.path.join(workdir, f'seg_{i:03d}{ext}')
+        if os.path.exists(p):
+            os.remove(p)
+
+# Write new segment files
+for i, (lang, chunk) in enumerate(new_segs):
+    with open(os.path.join(workdir, f'seg_{i:03d}.txt'), 'w') as f:
+        f.write(chunk)
+    with open(os.path.join(workdir, f'seg_{i:03d}.lang'), 'w') as f:
+        f.write(lang)
+
+print(len(new_segs))
+PYEOF
+    local new_count
+    new_count=$(python3 "$py_script" "$workdir" "$old_count")
+    rm -f "$py_script"
+    if [ -z "$new_count" ]; then
+        echo "0"
+        return 1
+    fi
+    echo "$new_count"
+}
+
+if [ "$PAUSE_PUNCTUATION" = "yes" ] && [ "$SEG_COUNT" -ge 1 ] 2>/dev/null; then
+    SEG_COUNT=$(split_punctuation_segments "$WORK_DIR" "$SEG_COUNT")
+fi
 
 # ── Split long monolingual segments at sentence boundaries ────────────────────
 # If a language segment exceeds MAX_SEGMENT_CHARS, break it into smaller
@@ -700,7 +880,13 @@ if [ -n "$OVERRIDE_TEXT" ]; then
 
     INITIAL_SPEED="${OVERRIDE_SPEED:-1.5}"
     rm -f "$MPV_SOCKET"
-    mpv "$FIRST_FILE" --no-terminal --input-ipc-server="$MPV_SOCKET" 200>&- &
+    # Pre-generate silence file for inter-segment pauses
+    SILENCE_FILE=""
+    if [ "$PAUSE_PUNCTUATION" = "yes" ] && [ "$PAUSE_DELAY_MS" -gt 0 ]; then
+        SILENCE_FILE=$(silence_file_for_delay "$PAUSE_DELAY_MS")
+    fi
+
+    mpv "$FIRST_FILE" --no-terminal --idle --input-ipc-server="$MPV_SOCKET" 200>&- &
     MPV_PID=$!
 
     # Wait for socket, then set initial playback speed
@@ -708,7 +894,7 @@ if [ -n "$OVERRIDE_TEXT" ]; then
         sleep 0.1
         if [ -S "$MPV_SOCKET" ]; then
             printf '{"command":["set_property","speed",%s]}\n' "$INITIAL_SPEED" \
-                | socat - "$MPV_SOCKET" 2>/dev/null 200>&-
+                | socat - "$MPV_SOCKET" 2>/dev/null >/dev/null 200>&-
             break
         fi
     done
@@ -723,10 +909,16 @@ if [ -n "$OVERRIDE_TEXT" ]; then
 
             if [ -f "$NEXT_FILE" ] && [ -s "$NEXT_FILE" ]; then
                 if [ -S "$MPV_SOCKET" ]; then
-                    printf '{"command":["loadfile","%s","append"]}\n' "$NEXT_FILE" \
-                        | socat - "$MPV_SOCKET" 2>/dev/null 200>&-
+                    if printf '{"command":["loadfile","%s","append"]}\n' "$NEXT_FILE" \
+                            | socat - "$MPV_SOCKET" 2>/dev/null >/dev/null 200>&-; then
+                        CURRENT_IDX=$NEXT_IDX
+                        # Inject silence between segments when configured
+                        if [ -n "$SILENCE_FILE" ] && [ "$NEXT_IDX" -lt "$SEG_COUNT" ]; then
+                            printf '{"command":["loadfile","%s","append"]}\n' "$SILENCE_FILE" \
+                                | socat - "$MPV_SOCKET" 2>/dev/null >/dev/null 200>&-
+                        fi
+                    fi
                 fi
-                CURRENT_IDX=$NEXT_IDX
             fi
 
             # Check if all generation jobs are done
@@ -741,7 +933,7 @@ if [ -n "$OVERRIDE_TEXT" ]; then
             if [ "$ALL_DONE" -eq 1 ] && [ "$NEXT_IDX" -ge "$SEG_COUNT" ]; then
                 break
             fi
-            sleep 0.3
+            sleep 0.1
         done
     ) &
 
@@ -841,9 +1033,15 @@ else
         exit 0
     fi
 
+    # Pre-generate silence file for inter-segment pauses
+    SILENCE_FILE=""
+    if [ "$PAUSE_PUNCTUATION" = "yes" ] && [ "$PAUSE_DELAY_MS" -gt 0 ]; then
+        SILENCE_FILE=$(silence_file_for_delay "$PAUSE_DELAY_MS")
+    fi
+
     echo "PLAYING" > "$TTS_STATUS_FILE"
     rm -f "$MPV_SOCKET"
-    mpv "$FIRST_FILE" --no-terminal --input-ipc-server="$MPV_SOCKET" 200>&- &
+    mpv "$FIRST_FILE" --no-terminal --idle --input-ipc-server="$MPV_SOCKET" 200>&- &
     MPV_PID=$!
 
     # ── Background: append remaining segments in order via IPC ──────────────
@@ -856,10 +1054,16 @@ else
 
             if [ -f "$NEXT_FILE" ] && [ -s "$NEXT_FILE" ]; then
                 if [ -S "$MPV_SOCKET" ]; then
-                    printf '{"command":["loadfile","%s","append"]}\n' "$NEXT_FILE" \
-                        | socat - "$MPV_SOCKET" 2>/dev/null 200>&-
+                    if printf '{"command":["loadfile","%s","append"]}\n' "$NEXT_FILE" \
+                            | socat - "$MPV_SOCKET" 2>/dev/null >/dev/null 200>&-; then
+                        CURRENT_IDX=$NEXT_IDX
+                        # Inject silence between segments when configured
+                        if [ -n "$SILENCE_FILE" ] && [ "$NEXT_IDX" -lt "$SEG_COUNT" ]; then
+                            printf '{"command":["loadfile","%s","append"]}\n' "$SILENCE_FILE" \
+                                | socat - "$MPV_SOCKET" 2>/dev/null >/dev/null 200>&-
+                        fi
+                    fi
                 fi
-                CURRENT_IDX=$NEXT_IDX
             fi
 
             ALL_DONE=1
@@ -873,7 +1077,7 @@ else
             if [ "$ALL_DONE" -eq 1 ] && [ "$NEXT_IDX" -ge "$SEG_COUNT" ]; then
                 break
             fi
-            sleep 0.3
+            sleep 0.1
         done
     ) &
 

@@ -392,12 +392,14 @@ class TTSWindow(Adw.ApplicationWindow):
         self._state     = AppState.IDLE
         self._is_paused = False
         self._has_audio = False  # Track if audio was successfully generated
+        self._loading   = True   # blocks _auto_save_settings during init
         self._manager   = TTSManager(
             on_state_change=self._set_state,
             on_error=self._show_error,
         )
         self._build_ui()
         self._load_saved_settings()
+        self._loading = False
         self.connect('close-request', self._on_close_request)
         self.connect('realize', self._resize_to_content)
         GLib.idle_add(self._check_wayland_clipboard)
@@ -545,9 +547,33 @@ class TTSWindow(Adw.ApplicationWindow):
 
         root.append(file_group)
 
+        # ── Playback ──────────────────────────────────────────────────────────
+        playback_group = Adw.PreferencesGroup(title='Playback')
+        self._pause_punct = Gtk.Switch(valign=Gtk.Align.CENTER)
+        pause_punct_row = Adw.ActionRow(title='Pause at Punctuation')
+        pause_punct_row.add_suffix(self._pause_punct)
+        pause_punct_row.set_activatable_widget(self._pause_punct)
+        pause_punct_row.set_subtitle('Add natural pauses at commas, periods, etc.')
+        playback_group.add(pause_punct_row)
+
+        self._pause_delay = Gtk.SpinButton(
+            valign=Gtk.Align.CENTER, numeric=True,
+            adjustment=Gtk.Adjustment(lower=0, upper=2000, step_increment=50, page_increment=100, value=100)
+        )
+        self._pause_delay.set_width_chars(6)
+        pause_delay_row = Adw.ActionRow(title='Pause Delay (ms)')
+        pause_delay_row.add_suffix(self._pause_delay)
+        pause_delay_row.set_subtitle('Silence between punctuation-split segments')
+        playback_group.add(pause_delay_row)
+        root.append(playback_group)
+
         # ── Controls ──────────────────────────────────────────────────────────
         btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL,
                           spacing=8, homogeneous=True)
+
+        self._save_cfg_btn = Gtk.Button(label='💾  Save', hexpand=True)
+        self._save_cfg_btn.add_css_class('pill')
+        self._save_cfg_btn.connect('clicked', self._on_save_settings)
 
         self._primary_btn = Gtk.Button(label='▶  Speak', hexpand=True)
         self._primary_btn.add_css_class('suggested-action')
@@ -558,6 +584,7 @@ class TTSWindow(Adw.ApplicationWindow):
         self._pause_btn.add_css_class('pill')
         self._pause_btn.connect('clicked', self._on_pause_resume)
 
+        btn_box.append(self._save_cfg_btn)
         btn_box.append(self._primary_btn)
         btn_box.append(self._pause_btn)
         root.append(btn_box)
@@ -672,6 +699,13 @@ class TTSWindow(Adw.ApplicationWindow):
 
         self._trans_api_entry.set_text(read_setting('translate_api_key', _d.get('translate_api_key', '')))
 
+        pause_punct = read_bool_setting('pause_punctuation', _d.get('pause_punctuation', True))
+        self._pause_punct.set_active(pause_punct)
+        try:
+            self._pause_delay.set_value(int(read_setting('pause_delay_ms', str(_d.get('pause_delay_ms', 100)))))
+        except ValueError:
+            self._pause_delay.set_value(100)
+
     # ── State machine ─────────────────────────────────────────────────────────
 
     def _set_state(self, state: AppState):
@@ -729,6 +763,30 @@ class TTSWindow(Adw.ApplicationWindow):
         self._is_paused = not self._is_paused
         self._pause_btn.set_label('▶  Resume' if self._is_paused else '⏸  Pause')
         self._manager.send_mpv(['cycle', 'pause'])
+
+    def _on_save_settings(self, _btn):
+        """Persist widget values when the user clicks Save."""
+        self._auto_save_settings()
+        self._status_lbl.set_label('✓  Settings saved')
+        GLib.timeout_add_seconds(2, lambda: self._status_lbl.set_label('○  Ready') or False)
+
+    def _auto_save_settings(self, *_):
+        """Persist widget values immediately when any preference changes."""
+        if self._loading or not hasattr(self, '_en_combo') or not self._en_combo:
+            return
+        en_idx = self._en_combo.get_selected()
+        ar_idx = self._ar_combo.get_selected()
+        de_idx = self._de_combo.get_selected()
+        src_lang = SOURCE_LANGUAGES[self._source_lang_combo.get_selected()][0]
+        trans_enabled = 'yes' if self._trans_enabled.get_active() else 'no'
+        trans_provider = TRANSLATION_PROVIDERS[self._trans_provider_combo.get_selected()][0]
+        trans_target = TRANSLATION_LANGUAGES[self._trans_target_combo.get_selected()][0]
+        trans_key = self._trans_api_entry.get_text()
+        pause_punct = 'yes' if self._pause_punct.get_active() else 'no'
+        pause_delay_ms = str(int(self._pause_delay.get_value()))
+        self._save_settings(en_idx, ar_idx, de_idx, src_lang,
+                            trans_enabled, trans_provider, trans_target,
+                            trans_key, pause_punct, pause_delay_ms)
 
     def _on_speed_changed(self, scale, lbl):
         val = int(scale.get_value())
@@ -800,8 +858,10 @@ class TTSWindow(Adw.ApplicationWindow):
         trans_provider = TRANSLATION_PROVIDERS[self._trans_provider_combo.get_selected()][0]
         trans_target = TRANSLATION_LANGUAGES[self._trans_target_combo.get_selected()][0]
         trans_key = self._trans_api_entry.get_text()
+        pause_punct = 'yes' if self._pause_punct.get_active() else 'no'
+        pause_delay_ms = str(int(self._pause_delay.get_value()))
 
-        self._save_settings(en_idx, ar_idx, de_idx, src_lang, trans_enabled, trans_provider, trans_target, trans_key)
+        self._save_settings(en_idx, ar_idx, de_idx, src_lang, trans_enabled, trans_provider, trans_target, trans_key, pause_punct, pause_delay_ms)
         self._set_state(AppState.GENERATING)   # instant feedback before first STATUS line
 
         cmd = [
@@ -816,6 +876,8 @@ class TTSWindow(Adw.ApplicationWindow):
             '--source-lang', src_lang,
             '--translate-enabled', trans_enabled,
             '--translate-provider', trans_provider,
+            '--pause-punctuation', pause_punct,
+            '--pause-delay-ms', pause_delay_ms,
         ]
         if trans_target:
             cmd += ['--translate-target', trans_target]
@@ -843,7 +905,9 @@ class TTSWindow(Adw.ApplicationWindow):
                        trans_enabled: str = None,
                        trans_provider: str = None,
                        trans_target: str = None,
-                       trans_key: str = None):
+                       trans_key: str = None,
+                       pause_punctuation: str = None,
+                       pause_delay_ms: str = None):
         """Persist all selections to ~/.config/tts_settings (single source of truth)."""
         _d = _SHARED.get('defaults', {})
         if src_lang is None:
@@ -856,6 +920,10 @@ class TTSWindow(Adw.ApplicationWindow):
             trans_target = _d.get('translate_target', '')
         if trans_key is None:
             trans_key = _d.get('translate_api_key', '')
+        if pause_punctuation is None:
+            pause_punctuation = 'yes' if _d.get('pause_punctuation', True) else 'no'
+        if pause_delay_ms is None:
+            pause_delay_ms = str(_d.get('pause_delay_ms', 100))
         en_rate = int(self._en_scale.get_value())
         ar_rate = int(self._ar_scale.get_value())
         de_rate = int(self._de_scale.get_value())
@@ -874,6 +942,8 @@ class TTSWindow(Adw.ApplicationWindow):
             'translate_provider': trans_provider,
             'translate_target': trans_target,
             'translate_api_key': trans_key,
+            'pause_punctuation': pause_punctuation,
+            'pause_delay_ms': pause_delay_ms,
         }
         try:
             os.makedirs(SHELL_CFG_DIR, exist_ok=True)

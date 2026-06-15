@@ -36,6 +36,8 @@ CURRENT_TRANSLATE_ENABLED=$(cat "$CONFIG_DIR/translate_enabled" 2>/dev/null || e
 CURRENT_TRANSLATE_PROVIDER=$(cat "$CONFIG_DIR/translate_provider" 2>/dev/null || echo "$DEFAULT_TRANSLATE_PROVIDER")
 CURRENT_TRANSLATE_TARGET=$(cat "$CONFIG_DIR/translate_target" 2>/dev/null || echo "$DEFAULT_TRANSLATE_TARGET")
 CURRENT_TRANSLATE_KEY=$(cat "$CONFIG_DIR/translate_api_key" 2>/dev/null || echo "")
+CURRENT_PAUSE_PUNCTUATION=$(cat "$CONFIG_DIR/pause_punctuation" 2>/dev/null || echo "yes")
+CURRENT_PAUSE_DELAY_MS=$(cat "$CONFIG_DIR/pause_delay_ms" 2>/dev/null || echo "100")
 [ -z "$CURRENT_RATE" ]    && CURRENT_RATE=$DEFAULT_RATE
 [ -z "$CURRENT_AR_RATE" ] && CURRENT_AR_RATE=$DEFAULT_AR_RATE
 [ -z "$CURRENT_DE_RATE" ] && CURRENT_DE_RATE=$DEFAULT_DE_RATE
@@ -82,6 +84,8 @@ RESULTS=$(yad --title="TTS Settings" --form --width=450 \
     --field="Translate Provider:CB"         "$TRANS_PROVIDERS" \
     --field="Translate Target:CB"          "$TRANS_TARGETS" \
     --field="Translate API Key:TEXT"        "$CURRENT_TRANSLATE_KEY" \
+    --field="Pause at Punctuation:CHK"         "$CURRENT_PAUSE_PUNCTUATION" \
+    --field="Pause Delay (ms):NUM"             "$CURRENT_PAUSE_DELAY_MS" \
     --field="Cache Folder ($CACHE_DIR):LBL" "" \
     --button="Save":0 --button="Cancel":1)
 EXIT_CODE=$?
@@ -100,6 +104,11 @@ if [ $EXIT_CODE -eq 0 ]; then
     TRANSLATE_PROVIDER=$(echo "$RESULTS" | cut -d'|' -f10)
     TRANSLATE_TARGET=$(echo "$RESULTS" | cut -d'|' -f11)
     TRANSLATE_KEY=$(echo "$RESULTS" | cut -d'|' -f12)
+    PAUSE_PUNCTUATION=$(echo "$RESULTS" | cut -d'|' -f13)
+    PAUSE_DELAY_MS=$(echo "$RESULTS" | cut -d'|' -f14 | cut -d'.' -f1 | grep -o '[0-9]\+' | head -1)
+    PAUSE_DELAY_MS=${PAUSE_DELAY_MS:-100}
+    if [ "$PAUSE_DELAY_MS" -lt 0 ] 2>/dev/null; then PAUSE_DELAY_MS=0; fi
+    if [ "$PAUSE_DELAY_MS" -gt 2000 ] 2>/dev/null; then PAUSE_DELAY_MS=2000; fi
 
     # Validate inputs
     # Validate speed values (0-200%)
@@ -140,6 +149,8 @@ if [ $EXIT_CODE -eq 0 ]; then
     echo "$TRANSLATE_PROVIDER" > "$CONFIG_DIR/translate_provider"
     echo "$TRANSLATE_TARGET"   > "$CONFIG_DIR/translate_target"
     echo "$TRANSLATE_KEY"  > "$CONFIG_DIR/translate_api_key"
+    echo "$PAUSE_PUNCTUATION" > "$CONFIG_DIR/pause_punctuation"
+    echo "$PAUSE_DELAY_MS" > "$CONFIG_DIR/pause_delay_ms"
 
-    notify-send "TTS Updated" "EN: $EN_VOICE (+${EN_RATE}%) | AR: $AR_VOICE (+${AR_RATE}%) | DE: $DE_VOICE (+${DE_RATE}%)"
+    notify-send "TTS Updated" "EN: $EN_VOICE (+${EN_RATE}%) | AR: $AR_VOICE (+${AR_RATE}%) | DE: $DE_VOICE (+${DE_RATE}%) | Pause: $PAUSE_PUNCTUATION (${PAUSE_DELAY_MS}ms)"
 fi
