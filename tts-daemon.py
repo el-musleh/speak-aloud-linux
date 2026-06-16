@@ -76,23 +76,48 @@ def _setup_logging():
     return logger
 
 
-def _create_icon():
-    """Generate a simple speaker icon."""
+def _icon_idle():
+    """Solid blue circle — ready / idle state."""
     img = Image.new('RGBA', (64, 64), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(img)
-    draw.rectangle([12, 20, 28, 44], fill=(50, 150, 250, 255))
-    draw.polygon([(28, 14), (28, 50), (48, 32)], fill=(50, 150, 250, 255))
+    d = ImageDraw.Draw(img)
+    d.ellipse([2, 2, 62, 62], fill=(33, 150, 243, 255))      # bright blue
+    return img
+
+
+def _icon_generating():
+    """Purple circle with white spinner arc — generating audio."""
+    img = Image.new('RGBA', (64, 64), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.ellipse([2, 2, 62, 62], fill=(156, 39, 176, 255))      # purple
+    # white spinner arc
+    d.pieslice([14, 14, 50, 50], start=0, end=270, fill=(255, 255, 255, 255))
+    return img
+
+
+def _icon_playing():
+    """Green circle with white play triangle — actively playing."""
+    img = Image.new('RGBA', (64, 64), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.ellipse([2, 2, 62, 62], fill=(76, 175, 80, 255))        # green
+    # white play triangle centered
+    d.polygon([(24, 18), (24, 46), (44, 32)], fill=(255, 255, 255, 255))
+    return img
+
+
+def _icon_paused():
+    """Orange circle with white pause bars — paused."""
+    img = Image.new('RGBA', (64, 64), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.ellipse([2, 2, 62, 62], fill=(255, 87, 34, 255))        # orange
+    # two white pause bars
+    d.rectangle([22, 18, 30, 46], fill=(255, 255, 255, 255))
+    d.rectangle([34, 18, 42, 46], fill=(255, 255, 255, 255))
     return img
 
 
 def _notify(title, icon='audio-speakers'):
-    try:
-        subprocess.run(
-            ['notify-send', '--icon', icon, '--expire-time', '3000', title],
-            capture_output=True, timeout=5
-        )
-    except Exception:
-        pass
+    # Notifications disabled — tray icon only
+    pass
 
 
 def _send_mpv(cmd):
@@ -113,6 +138,14 @@ class TTSDaemon:
         self._last_notify = None
         self._listener = None
         self._lock_fd = None
+        self._running = True
+
+        self._icons = {
+            'IDLE':       _icon_idle(),
+            'GENERATING': _icon_generating(),
+            'PLAYING':    _icon_playing(),
+            'PAUSED':     _icon_paused(),
+        }
 
         self._acquire_lock()
         self.log.info('Daemon started (PID %d)', os.getpid())
@@ -150,14 +183,14 @@ class TTSDaemon:
 
         self._icon = pystray.Icon(
             'tts-daemon',
-            icon=_create_icon(),
+            icon=self._icons['IDLE'],
             title='Speak a Loud — ○ Ready',
             menu=menu
         )
 
     def _start_poll(self):
         def loop():
-            while self._icon.running:
+            while self._running:
                 self._tick()
                 time.sleep(0.5)
         threading.Thread(target=loop, daemon=True).start()
@@ -169,11 +202,37 @@ class TTSDaemon:
         except (FileNotFoundError, OSError):
             state = 'IDLE'
 
+        # Self-correction: if status is active but speak.sh is gone, force IDLE
+        if state in ('PLAYING', 'GENERATING', 'PAUSED', 'RETRYING'):
+            try:
+                result = subprocess.run(
+                    ['pgrep', '-f', 'speak.sh'],
+                    capture_output=True, timeout=1
+                )
+                if result.returncode != 0:
+                    state = 'IDLE'
+                    try:
+                        with open(STATUS_FILE, 'w') as f:
+                            f.write('IDLE')
+                    except OSError:
+                        pass
+                    self.log.info('Self-correct: speak.sh gone — forcing IDLE')
+            except Exception:
+                pass
+
         if state != self._state:
             self._state = state
             label = _STATE_LABELS.get(state, '○  Ready')
             self._icon.title = f'Speak a Loud — {label}'
-            self.log.info('State: %s', state)
+            new_icon = self._icons.get(state, self._icons['IDLE'])
+            self._icon.icon = new_icon
+            # Aggressive refresh: hide → show forces indicator recreation
+            if hasattr(self._icon, '_hide') and hasattr(self._icon, '_show'):
+                self._icon._hide()
+                self._icon._show()
+            elif hasattr(self._icon, '_update_icon'):
+                self._icon._update_icon()
+            self.log.info('State: %s — icon updated', state)
             self._do_notify(state)
             self._sync_media_keys(state)
 
@@ -265,6 +324,7 @@ class TTSDaemon:
 
     def _on_quit(self, icon, item):
         self.log.info('Quit requested')
+        self._running = False
         self._stop_keys()
         if self._lock_fd:
             try:

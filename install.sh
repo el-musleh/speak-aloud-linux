@@ -69,8 +69,8 @@ else
     echo -e "  ${CYAN}source ~/.profile && export PATH=\"\$HOME/.local/bin:\$PATH\"${RESET}"
 fi
 
-# Optional: pystray + pynput for the system-tray icon and media keys
-for pkg in pystray pynput; do
+# Optional: pystray + pynput + langdetect for tray icon, media keys, and language detection
+for pkg in pystray pynput langdetect; do
     if ! python3 -c "import $pkg" 2>/dev/null; then
         echo "Installing $pkg..."
         if python3 -m pip install --user "$pkg" 2>/dev/null; then

@@ -12,6 +12,8 @@ if ! pgrep -f "tts-daemon.py" > /dev/null 2>&1; then
 fi
 
 CONFIG_DIR="$HOME/.config/tts_settings"
+# Notifications disabled — tray icon only
+notify-send() { :; }
 # Use system temp directory for portability
 TEMP_DIR="${TMPDIR:-/tmp}"
 WORK_DIR="$TEMP_DIR/speak-aloud-work"
@@ -130,7 +132,8 @@ fi
 
 # Lock (fd 200) is held for the entire lifetime of this script, including
 # playback. New invocations interrupt us via the mpv socket + interrupt flag.
-trap 'cleanup_temp_files' EXIT
+# Combine cleanup + tray reset (line 101 trap is intentionally overridden here).
+trap 'cleanup_temp_files; echo "IDLE" > "$TTS_STATUS_FILE"' EXIT
 
 # Temporary file management
 declare -a TEMP_FILES=()
@@ -391,113 +394,76 @@ arabic = re.compile(
 
 GERMAN_CHARS = re.compile(r'[äöüßÄÖÜẞ]')
 
-# Words that are German and essentially never appear in English text.
-STRONG_DE = {
-    'der', 'das', 'dem', 'des', 'ein', 'eine', 'einen', 'einem', 'eines',
-    'und', 'oder', 'aber', 'mit', 'zu', 'von', 'aus', 'bei', 'nach', 'wie',
-    'wenn', 'weil', 'dass', 'ist', 'sind', 'waren', 'wird', 'werden',
-    'wurde', 'wurden', 'haben', 'hatte', 'hatten', 'kann', 'wollen',
-    'soll', 'sollen', 'muss', 'darf',
-    'ich', 'du', 'wir', 'ihr', 'sie', 'mir', 'dir', 'ihm', 'uns', 'euch',
-    'nicht', 'kein', 'keine', 'ja', 'nein', 'bitte', 'danke', 'guten',
-    'abend', 'hallo', 'wiedersehen', 'auf',
-    'schlecht', 'klein', 'neu',
-    'heute', 'gestern', 'jetzt', 'hier', 'dort',
-    'viel', 'wenig', 'mehr', 'meiste', 'alle', 'jede', 'jeder', 'jedes',
-    'mann', 'frau', 'freund', 'freundin', 'haus', 'stadt', 'welt',
-    'essen', 'trinken', 'gehen', 'kommen', 'sprechen', 'lesen',
-    'schreiben', 'machen', 'tun', 'geben', 'nehmen', 'finden', 'denken',
-    'wissen', 'wasser', 'brot', 'milch', 'kaffee', 'bier',
-    'eins', 'zwei', 'drei', 'vier', 'sechs', 'sieben', 'acht', 'neun',
-    'zehn',
+# Minimal fallback for very short fragments where langdetect is unreliable.
+_FALLBACK_DE = {
+    'der', 'die', 'das', 'den', 'dem', 'des', 'ein', 'eine', 'und', 'mit',
+    'zu', 'von', 'bei', 'nach', 'ist', 'sind', 'du', 'ich', 'wir', 'nicht',
+    'an', 'am', 'im', 'zum', 'zur', 'für', 'oder', 'aber', 'wenn', 'dass',
+    'wird', 'werden', 'haben', 'kann', 'soll', 'muss', 'ja', 'nein',
 }
 
-# Words that exist in both German and English. They only count as German
-# when directly adjacent to an already-German token (e.g. "Guten Morgen").
-AMBIG_DE = {
-    'die', 'den', 'war', 'hat', 'will', 'es', 'er', 'da', 'als', 'mag',
-    'tag', 'morgen', 'kind', 'alt', 'land', 'wein', 'gut', 'tee',
-}
+SENT_RE = re.compile(r'(?<=[.!?])\s+')
 
-WORD_RE = re.compile(r'\S+')
-TRIM_RE = re.compile(r'^\W+|\W+$', re.UNICODE)
+
+def _has_umlaut(text):
+    return bool(GERMAN_CHARS.search(text))
+
+
+def _fallback_detect(text):
+    """Word-list fallback for fragments too short for langdetect."""
+    words = re.findall(r'\b\w+\b', text.lower())
+    if not words:
+        return 'en'
+    de_count = sum(1 for w in words if w in _FALLBACK_DE)
+    if de_count >= max(1, len(words) // 4):
+        return 'de'
+    return 'en'
+
 
 def classify_block(chunk):
-    """Split a non-Arabic block into ('en'/'de', text) phrase segments.
+    """Classify a non-Arabic text block as English or German using langdetect.
 
-    English is the default; tokens are marked German only with strong
-    evidence (umlauts/eszett or unambiguous German words). Ambiguous
-    words are promoted to German only when adjacent to German tokens.
-    A German run is kept only if it has an umlaut token, or 2+ strong
-    markers, or a strong marker plus at least one neighbour.
+    Arabic is handled separately before this function is called.
+    The block is split into sentences for finer-grained detection,
+    then consecutive same-language sentences are merged.
     """
-    toks = [(m.group(), m.start(), m.end()) for m in WORD_RE.finditer(chunk)]
-    n = len(toks)
-    if n == 0:
+    chunk = chunk.strip()
+    if not chunk:
         return []
-    kind = []
-    for w, _, _ in toks:
-        key = TRIM_RE.sub('', w).lower()
-        if GERMAN_CHARS.search(w):
-            kind.append('umlaut')
-        elif key in STRONG_DE:
-            kind.append('strong')
-        elif key in AMBIG_DE:
-            kind.append('ambig')
+
+    # Umlauts are unambiguous German markers — short-circuit the whole block
+    if _has_umlaut(chunk):
+        return [('de', chunk)]
+
+    # Split into sentences for finer-grained detection
+    sentences = [s.strip() for s in SENT_RE.split(chunk) if s.strip()]
+    if not sentences:
+        sentences = [chunk]
+
+    results = []
+    for sent in sentences:
+        words = re.findall(r'\b\w+\b', sent)
+        if len(words) < 4:
+            # Too short for langdetect — use minimal fallback list
+            results.append((_fallback_detect(sent), sent))
+            continue
+
+        try:
+            from langdetect import detect_langs
+            probs = detect_langs(sent)
+            de_prob = next((p.prob for p in probs if p.lang == 'de'), 0.0)
+            results.append(('de' if de_prob >= 0.70 else 'en', sent))
+        except Exception:
+            results.append(('en', sent))
+
+    # Merge consecutive same-language segments
+    merged = []
+    for lang, text in results:
+        if merged and merged[-1][0] == lang:
+            merged[-1] = (lang, merged[-1][1] + ' ' + text)
         else:
-            kind.append('en')
-    # Promote ambiguous tokens that touch a German token (chains allowed),
-    # and bridge unknown tokens flanked by German tokens on BOTH sides so
-    # full German sentences with out-of-list words stay in one run.
-    GERMANISH = ('umlaut', 'strong', 'de')
-    changed = True
-    while changed:
-        changed = False
-        for i in range(n):
-            if kind[i] == 'ambig':
-                if (i > 0 and kind[i-1] in GERMANISH) or \
-                   (i + 1 < n and kind[i+1] in GERMANISH):
-                    kind[i] = 'de'
-                    changed = True
-            elif kind[i] == 'en':
-                # Bridge an unknown word when both neighbours are German
-                # (one side may still be an unpromoted ambiguous word).
-                if 0 < i < n - 1:
-                    left, right = kind[i-1], kind[i+1]
-                    if (left in GERMANISH and right in GERMANISH + ('ambig',)) or \
-                       (right in GERMANISH and left in GERMANISH + ('ambig',)):
-                        kind[i] = 'de'
-                        changed = True
-    # Group tokens into runs and decide each run's language
-    out = []  # (lang, first_tok_idx, last_tok_idx_exclusive)
-    i = 0
-    while i < n:
-        german_ish = kind[i] in ('umlaut', 'strong', 'de')
-        j = i
-        while j < n and (kind[j] in ('umlaut', 'strong', 'de')) == german_ish:
-            j += 1
-        if german_ish:
-            has_umlaut = any(kind[k] == 'umlaut' for k in range(i, j))
-            strong_cnt = sum(1 for k in range(i, j)
-                             if kind[k] in ('umlaut', 'strong'))
-            if has_umlaut or strong_cnt >= 2 or (strong_cnt >= 1 and j - i >= 2):
-                out.append(('de', i, j))
-            else:
-                out.append(('en', i, j))
-        else:
-            out.append(('en', i, j))
-        i = j
-    # Absorb a single sentence-final unknown word into a preceding German
-    # run of 3+ tokens (e.g. "... nach Hause." where "Hause" is unlisted).
-    for idx in range(len(out) - 1):
-        lang, a, b = out[idx]
-        nlang, na, nb = out[idx + 1]
-        if lang == 'de' and nlang == 'en' and b - a >= 3 \
-                and toks[na][0].rstrip('"\')')[-1:] in '.!?':
-            out[idx] = ('de', a, na + 1)
-            out[idx + 1] = ('en', na + 1, nb)
-    out = [(lang, a, b) for lang, a, b in out if b > a]
-    return [(lang, chunk[toks[a][1]:toks[b-1][2]]) for lang, a, b in out]
+            merged.append((lang, text))
+    return merged
 
 # Pass 1: split out Arabic runs (highest priority)
 raw_segs, last = [], 0
@@ -943,6 +909,7 @@ if [ -n "$OVERRIDE_TEXT" ]; then
             sleep 0.1
         done
     ) &
+    APPEND_PID=$!
 
     # ── Wait for all generation to complete (foreground) ──────────────────
     FAILED=0
@@ -961,10 +928,29 @@ if [ -n "$OVERRIDE_TEXT" ]; then
         exit 0
     fi
 
-    # Hold the lock while mpv plays; a new instance interrupts us by sending
-    # "quit" over the socket, which makes this wait return.
+    # Wait for background append loop to finish
+    wait "$APPEND_PID"
+
+    # All files appended. Poll mpv until idle, then quit it.
+    IDLE_COUNT=0
+    while kill -0 "$MPV_PID" 2>/dev/null; do
+        if [ -S "$MPV_SOCKET" ]; then
+            if echo '{"command":["get_property","core-idle"]}' | socat - "$MPV_SOCKET" 2>/dev/null | grep -q '"data":true'; then
+                IDLE_COUNT=$((IDLE_COUNT + 1))
+                if [ "$IDLE_COUNT" -ge 2 ]; then
+                    echo '{"command":["quit"]}' | socat - "$MPV_SOCKET" 2>/dev/null >/dev/null
+                    break
+                fi
+            else
+                IDLE_COUNT=0
+            fi
+        fi
+        sleep 0.5
+    done
+
     wait "$MPV_PID"
     rm -f "$MPV_SOCKET"
+    echo "IDLE" > "$TTS_STATUS_FILE"
 
     # Export to file if --output was requested
     if [ -n "$OUTPUT_FILE" ]; then
@@ -1087,6 +1073,7 @@ else
             sleep 0.1
         done
     ) &
+    APPEND_PID=$!
 
     # ── Wait for all generation to complete (foreground) ────────────────────
     FAILED=0
@@ -1120,9 +1107,28 @@ else
         notify-send "TTS Export" "Saved audio to $OUTPUT_FILE"
     fi
 
-    # Hold the lock while mpv plays; a new instance interrupts us by sending
-    # "quit" over the socket, which makes this wait return.
+    # Wait for background append loop to finish
+    wait "$APPEND_PID"
+
+    # All files appended. Poll mpv until idle, then quit it.
+    IDLE_COUNT=0
+    while kill -0 "$MPV_PID" 2>/dev/null; do
+        if [ -S "$MPV_SOCKET" ]; then
+            if echo '{"command":["get_property","core-idle"]}' | socat - "$MPV_SOCKET" 2>/dev/null | grep -q '"data":true'; then
+                IDLE_COUNT=$((IDLE_COUNT + 1))
+                if [ "$IDLE_COUNT" -ge 2 ]; then
+                    echo '{"command":["quit"]}' | socat - "$MPV_SOCKET" 2>/dev/null >/dev/null
+                    break
+                fi
+            else
+                IDLE_COUNT=0
+            fi
+        fi
+        sleep 0.5
+    done
+
     wait "$MPV_PID"
     rm -f "$MPV_SOCKET"
+    echo "IDLE" > "$TTS_STATUS_FILE"
 
 fi

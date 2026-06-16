@@ -2,6 +2,8 @@
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_DIR="$HOME/.config/tts_settings"
+# Notifications disabled — tray icon only
+notify-send() { :; }
 
 # ── Helper: read tts-shared.json via python3 ────────────────────────────────
 _json_get() {
